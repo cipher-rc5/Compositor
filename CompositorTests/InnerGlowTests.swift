@@ -2,7 +2,7 @@ import AppKit
 import Testing
 @testable import Compositor
 
-@Suite struct InnerGlowTests {
+@MainActor @Suite struct InnerGlowTests {
     private func solidSquare(size: Int = 40, color: PaletteColor = PaletteColor(red: 1, green: 1, blue: 1)) throws -> CGImage {
         let context = try BrushRaster.context(width: size, height: size, mask: false)
         context.setFillColor(CGColor(srgbRed: color.red, green: color.green, blue: color.blue, alpha: 1))

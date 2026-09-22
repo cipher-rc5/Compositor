@@ -43,7 +43,9 @@ final class ProjectWindowView: NSView {
 }
 
 private final class ProjectWindowDelegate: NSObject, NSWindowDelegate {
-    weak var previous: NSWindowDelegate?
+    // Read from the nonisolated forwarding overrides below, which AppKit only calls on
+    // the main thread; `NSWindowDelegate` isn't Sendable, so the compiler can't see that.
+    nonisolated(unsafe) weak var previous: NSWindowDelegate?
     weak var controller: ProjectController?
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         guard let controller else { return true }
@@ -53,10 +55,13 @@ private final class ProjectWindowDelegate: NSObject, NSWindowDelegate {
         }
         return false
     }
-    override func responds(to selector: Selector!) -> Bool {
+    // NSObject declares these nonisolated, and the Objective-C runtime calls them while
+    // forwarding a message, so they have to stay nonisolated to match. Both only read
+    // `previous`, which the runtime touches on the main thread here.
+    nonisolated override func responds(to selector: Selector!) -> Bool {
         super.responds(to: selector) || previous?.responds(to: selector) == true
     }
-    override func forwardingTarget(for selector: Selector!) -> Any? {
+    nonisolated override func forwardingTarget(for selector: Selector!) -> Any? {
         previous?.responds(to: selector) == true ? previous : super.forwardingTarget(for: selector)
     }
 }

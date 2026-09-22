@@ -240,7 +240,10 @@ final class InlineTextEditor: NSView, NSTextViewDelegate {
 
     /// Every mouse move while the box is open, wherever the pointer is. Tracking areas stop arriving once the text
     /// surface has the mouse, which left the cursor stuck on whatever it was last set to.
-    private var moveMonitor: Any?
+    // Torn down in deinit, which is nonisolated in Swift 6; the monitor is an opaque
+    // `Any?` the compiler can't prove Sendable, and this view only ever deinits on the
+    // main thread.
+    nonisolated(unsafe) private var moveMonitor: Any?
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         if let moveMonitor { NSEvent.removeMonitor(moveMonitor); self.moveMonitor = nil }

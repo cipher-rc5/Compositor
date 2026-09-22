@@ -371,7 +371,9 @@ extension View {
     var editing = false
     var value: () -> Double = { 0 }
     var change: (Double) -> Void = { _ in }
-    private var monitor: Any?
+    // Removed in deinit, which is nonisolated in Swift 6; the monitor is an opaque `Any?`
+    // the compiler can't prove Sendable, and this only ever deinits on the main thread.
+    nonisolated(unsafe) private var monitor: Any?
 
     /// Takes Up and Down while the field holds focus: one step, or ten with Shift.
     func listen(step: Double) {

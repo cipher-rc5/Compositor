@@ -241,7 +241,7 @@ nonisolated struct CameraRawCalibrationSettings: Equatable, Sendable {
     func applying(shows: Bool) -> Self { shows ? self : Self() }
 }
 
-extension CameraRawSettings {
+nonisolated extension CameraRawSettings {
     func applyCalibration(pixels: UnsafeMutablePointer<UInt8>, width: Int, height: Int, stride: Int) {
         let calibration = calibration.normalized
         guard calibration.adjusts else { return }

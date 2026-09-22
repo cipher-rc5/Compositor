@@ -68,6 +68,19 @@ Because it’s open source, you can download the Xcode project and add, remove, 
 
 Open `Compositor.xcodeproj` and run the **Compositor** scheme.
 
+Or, with [`just`](https://github.com/casey/just) (`brew install just`), `just dev`
+builds a Debug build and launches it. `just` on its own lists every recipe —
+`build`, `test`, `deps`, `update`, `clean`, `release` and the rest.
+
+## Testing
+
+`just test` runs the unit suites (`CompositorTests`). These run unattended.
+
+`just test-ui` runs the XCUITest suites, which drive the real app. They need a
+logged-in desktop and Xcode Helper allowed under System Settings › Privacy &
+Security › Accessibility; without that the runner is killed at startup with
+"Timed out while enabling automation mode". `just test-all` runs both.
+
 ## Releasing
 
 `scripts/release.sh` builds a Release version, signs it with Developer ID, notarizes and staples it, and packages it into `dist/Compositor-<version>.dmg`.

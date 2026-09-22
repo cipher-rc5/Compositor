@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-struct ShortcutChord: Codable, Equatable, Hashable {
+nonisolated struct ShortcutChord: Codable, Equatable, Hashable {
     var key: String
     var modifiers: Int
     init(_ key: String, _ modifiers: Int = 0) { self.key = key; self.modifiers = modifiers }

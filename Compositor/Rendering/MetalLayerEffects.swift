@@ -4,7 +4,7 @@ import Metal
 /// Layer effects on the GPU: the outline's reach and the shadow's blur are the two heavy passes, and both are
 /// separable, so each runs as a row pass and a column pass over the same pixels. Falls back to the CPU renderer
 /// when Metal isn't available (see `LayerEffectsRenderer`).
-final class MetalLayerEffects {
+nonisolated final class MetalLayerEffects: @unchecked Sendable {
     static let shared: MetalLayerEffects? = try? MetalLayerEffects()
     private let device: MTLDevice
     private let queue: MTLCommandQueue

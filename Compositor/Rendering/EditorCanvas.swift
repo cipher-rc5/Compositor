@@ -1979,10 +1979,14 @@ final class CanvasView: NSView {
     private func updateAntsTimer() {
         let active = session.selection?.isEmpty == false && window != nil
         if active, antsTimer == nil {
+            // Timer's closure is @Sendable, but this one is added to the main run loop below,
+            // so it only ever fires on the main thread.
             let timer = Timer(timeInterval: 0.12, repeats: true) { [weak self] _ in
-                guard let self else { return }
-                self.transformOverlay.antsPhase = (self.transformOverlay.antsPhase + 1).truncatingRemainder(dividingBy: 8)
-                self.transformOverlay.needsDisplay = true
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.transformOverlay.antsPhase = (self.transformOverlay.antsPhase + 1).truncatingRemainder(dividingBy: 8)
+                    self.transformOverlay.needsDisplay = true
+                }
             }
             RunLoop.main.add(timer, forMode: .common)
             antsTimer = timer
