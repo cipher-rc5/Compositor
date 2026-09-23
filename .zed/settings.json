@@ -1,0 +1,22 @@
+// Project settings for Zed. Swift support comes from the "swift" extension.
+{
+  "languages": {
+    "Swift": {
+      "language_servers": ["sourcekit-lsp"],
+      "tab_size": 4,
+      // sourcekit-lsp formats with swift-format, which the project doesn't use;
+      // formatting on save would rewrite every file touched.
+      "format_on_save": "off"
+    }
+  },
+  "lsp": {
+    "sourcekit-lsp": {
+      // Run the server from the selected Xcode toolchain, so it matches the
+      // compiler that builds the project.
+      "binary": {
+        "path": "xcrun",
+        "arguments": ["sourcekit-lsp"]
+      }
+    }
+  }
+}

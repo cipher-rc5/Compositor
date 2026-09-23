@@ -41,12 +41,14 @@
 		};
 		8F311FA9304F03BC0017D14F /* CompositorTests */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			path = CompositorTests;
+			name = CompositorTests;
+			path = Tests/CompositorTests;
 			sourceTree = "<group>";
 		};
 		8F311FB3304F03BC0017D14F /* CompositorUITests */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			path = CompositorUITests;
+			name = CompositorUITests;
+			path = Tests/CompositorUITests;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
