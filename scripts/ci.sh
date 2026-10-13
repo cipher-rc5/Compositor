@@ -22,7 +22,14 @@ echo "==> Building (clean, warnings are errors)"
 # Clean, so every file compiles and reports its warnings, not just the ones that changed.
 if ! xcodebuild clean build-for-testing "${common[@]}" \
      SWIFT_TREAT_WARNINGS_AS_ERRORS=YES GCC_TREAT_WARNINGS_AS_ERRORS=YES >"$LOG" 2>&1; then
-  grep -E ': (error|warning): ' "$LOG" | sort -u || tail -40 "$LOG"
+  # A compiler crash prints no "error:" line, only a stack dump; show that rather than nothing.
+  diagnostics=$(grep -E ': (error|warning): ' "$LOG" | sort -u || true)
+  if [[ -n "$diagnostics" ]]; then
+    print -r -- "$diagnostics"
+  else
+    grep -E -A3 '^Stack dump:|While (evaluating|emitting)|^The following build commands failed:' "$LOG" | cut -c1-300 \
+      || tail -40 "$LOG"
+  fi
   echo "==> Build failed (full log: $LOG)"
   exit 1
 fi

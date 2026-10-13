@@ -186,7 +186,7 @@ struct CameraRawControls: View {
             HStack(spacing: 10) {
                 Text("White Balance").frame(minWidth: Self.labelWidth, alignment: .leading)
                     .help("Auto balances the average color. Custom follows Temperature and Tint.")
-                Picker("White Balance", selection: Binding(get: { raw.whiteBalance }, set: setWhiteBalance)) {
+                Picker("White Balance", selection: Binding(get: { raw.whiteBalance }, set: { setWhiteBalance($0) })) {
                     ForEach(CameraRawWhiteBalance.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                 }
                 .labelsHidden()

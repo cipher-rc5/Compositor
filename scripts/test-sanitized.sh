@@ -68,6 +68,14 @@ if [[ -n "$reports" ]]; then
   exit 1
 fi
 if (( result != 0 )); then
+  if grep -q '\*\* TEST BUILD FAILED \*\*\|\*\* BUILD FAILED \*\*' "$LOG"; then
+    # The build never finished, so no test ran: show why, not a test count.
+    grep -E ': error: ' "$LOG" | sort -u \
+      || grep -E -A3 '^Stack dump:|While (evaluating|emitting)|^The following build commands failed:' "$LOG" | cut -c1-300 \
+      || tail -40 "$LOG"
+    echo "==> The sanitized build failed (full log: $LOG)"
+    exit 1
+  fi
   if [[ -d "$RESULT" ]]; then summarize || true; else tail -40 "$LOG"; fi
   echo "==> Sanitized tests failed (full log: $LOG)"
   exit 1

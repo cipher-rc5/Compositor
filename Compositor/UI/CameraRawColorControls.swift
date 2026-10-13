@@ -38,7 +38,7 @@ struct CameraRawCurveControls: View {
                         .foregroundStyle(.secondary)
                         .help("Input and output of the selected curve point.")
                 }
-                Picker("Preset", selection: Binding(get: { CurvePreset.matching(currentPoints) }, set: applyPreset)) {
+                Picker("Preset", selection: Binding(get: { CurvePreset.matching(currentPoints) }, set: { applyPreset($0) })) {
                     Text("Custom").tag(CurvePreset.custom)
                     Text("Linear").tag(CurvePreset.linear)
                     Text("Medium Contrast").tag(CurvePreset.medium)
