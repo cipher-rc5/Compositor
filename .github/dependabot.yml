@@ -1,0 +1,24 @@
+# Dependency update pull requests. Each one runs through the CI workflow like any other pull request.
+version: 2
+updates:
+  # Sparkle, the app's only Swift package. Dependabot finds Compositor.xcodeproj from the repository root and
+  # reads its Package.resolved (Compositor.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/).
+  - package-ecosystem: swift
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: build
+
+  # The actions in .github/workflows, which are pinned by commit SHA; Dependabot moves the SHA and the
+  # version comment beside it together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ['*']
+    commit-message:
+      prefix: ci

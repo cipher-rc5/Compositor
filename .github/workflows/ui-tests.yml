@@ -1,0 +1,65 @@
+# The XCUITest suites (Tests/CompositorUITests), the hosted copy of `just test-ui`. They drive the real app, so they
+# need a logged-in desktop and Xcode Helper allowed under Accessibility; locally that's a manual step (CONTRIBUTING.md).
+# GitHub's macOS images grant it: runner-images' configure-tccdb-macos.sh writes a kTCCServiceAccessibility entry for
+# com.apple.dt.Xcode-Helper into the system TCC database. That's the image's doing, not something promised, so if a
+# run dies at startup with "Timed out while enabling automation mode", check that script before the tests.
+#
+# Run on demand only: the suites take minutes, need the whole desktop, and stay out of the CI gate, as they do locally.
+name: UI tests
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ui-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  xcuitest:
+    name: XCUITest
+    # The generally available image and Xcode; see ci.yml for why these satisfy the macOS 26.5 target.
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Select Xcode 26.6
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
+        with:
+          xcode-version: '26.6'
+
+      - name: Resolve Swift packages from Package.resolved
+        run: >
+          xcodebuild -resolvePackageDependencies
+          -project Compositor.xcodeproj
+          -scheme Compositor
+          -derivedDataPath build
+          -onlyUsePackageVersionsFromResolvedFile
+
+      # The same command as `just test-ui`, with a result bundle to upload.
+      - name: Run the UI tests
+        run: >
+          xcodebuild test
+          -project Compositor.xcodeproj
+          -scheme Compositor
+          -configuration Debug
+          -destination 'platform=macOS'
+          -derivedDataPath build
+          CODE_SIGN_IDENTITY=- CODE_SIGNING_REQUIRED=NO
+          -only-testing:CompositorUITests
+          -resultBundlePath build/ui-tests.xcresult
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ui-tests
+          path: build/ui-tests.xcresult
+          retention-days: 14
+          if-no-files-found: ignore

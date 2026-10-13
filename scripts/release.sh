@@ -24,8 +24,27 @@ VERSION=$(print -r -- "$settings" | awk -F' = ' '/ MARKETING_VERSION = /{print $
 BUILD=$(print -r -- "$settings" | awk -F' = ' '/ CURRENT_PROJECT_VERSION = /{print $2; exit}')
 echo "==> $APP $VERSION ($BUILD)"
 
+# What this DMG is built from, recorded beside it so publish.sh can refuse a DMG that isn't the commit it's
+# about to tag. Uncommitted changes are built (handy for a trial run) but such a DMG can't be published.
+COMMIT=$(git -C "$PROJECT_DIR" rev-parse HEAD)
+DIRTY=no
+if [[ -n "$(git -C "$PROJECT_DIR" status --porcelain)" ]]; then
+  DIRTY=yes
+  echo "==> Warning: the working tree has uncommitted changes; publish.sh will refuse this build"
+fi
+
+# Nothing gets signed and notarized unless it builds cleanly and its tests pass.
+# SKIP_CI=1 skips this for a build whose exact commit already passed.
+CI=skipped
+if [[ "${SKIP_CI:-}" != 1 ]]; then
+  "$PROJECT_DIR/scripts/ci.sh"
+  CI=passed
+fi
+
 rm -rf "$WORK"
 mkdir -p "$WORK" "$DIST"
+# Written again only once the DMG is signed, notarized and stapled, so a failed run leaves nothing publishable.
+rm -f "$DIST/$APP-$VERSION.build-info"
 
 echo "==> Archiving a Release build"
 xcodebuild archive -quiet \
@@ -86,4 +105,8 @@ xcrun stapler staple "$DMG"
 echo "==> What Gatekeeper will say on another Mac"
 spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG"
 spctl --assess --type execute --verbose=2 "$APP_PATH"
+print -r -- "commit=$COMMIT
+dirty=$DIRTY
+ci=$CI" > "$DIST/$APP-$VERSION.build-info"
+echo "==> SHA-256: $(shasum -a 256 "$DMG" | awk '{print $1}')"
 echo "==> Done: $DMG"

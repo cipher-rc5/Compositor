@@ -63,6 +63,19 @@ test-all:
       -project "{{project}}" -scheme "{{scheme}}" -configuration Debug \
       -destination 'platform=macOS' -derivedDataPath "{{derived}}" {{signing}}
 
+# The local CI gate: clean warning-free build, then the unit tests. Runs before every push once `just hooks` is on.
+ci:
+    @./scripts/ci.sh
+
+# Run the CI gate before every `git push` in this clone (skip one push with `git push --no-verify`).
+hooks:
+    @git config core.hooksPath .githooks
+    @echo "==> pre-push now runs scripts/ci.sh"
+
+# Run the unit tests under Address and Undefined Behavior Sanitizers (for the C pixel kernels); builds in build/sanitize.
+test-sanitized:
+    @./scripts/test-sanitized.sh
+
 # Run one test target, e.g. `just test-only CompositorTests/BrushTests`.
 test-only target:
     @xcodebuild test \

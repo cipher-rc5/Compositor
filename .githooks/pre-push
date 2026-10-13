@@ -1,0 +1,4 @@
+#!/bin/zsh
+# Runs the local CI gate before anything is pushed. Enable once per clone with `just hooks`.
+# In an emergency, `git push --no-verify` skips it.
+exec "$(git rev-parse --show-toplevel)/scripts/ci.sh"
