@@ -1,8 +1,12 @@
 import AppKit
+import os
 
 /// Immutable sparse raster. Paint commits share untouched tiles with their source.
 /// A contiguous CGImage backing is materialized only when a consumer (export or an
 /// image-processing operation) actually requests its bytes, never on mouse-up.
+/// Unchecked because of that lazy backing: every stored property is a `let` of an immutable value except
+/// `materialized` and `materializeFailed`, which are only read or written with `lock` held; the context's pixels are
+/// drawn once, under the lock, and only read after that.
 nonisolated final class RasterSnapshot: @unchecked Sendable {
     let width: Int
     let height: Int
@@ -16,6 +20,9 @@ nonisolated final class RasterSnapshot: @unchecked Sendable {
     private var bytesPerPixel: Int { isMask ? 1 : 4 }
     private let lock = NSLock()
     private var materialized: CGContext?
+    /// Set once making the contiguous pixels has failed and been logged, so a draw retried every frame logs once.
+    private var materializeFailed = false
+    private static let log = Logger.compositor("Rendering")
 
     init(width: Int, height: Int, base: CGImage?, baseRect: CGRect, patches: [BrushPatch], isMask: Bool = false, alignment: CGPoint? = nil) {
         self.width = width
@@ -155,14 +162,77 @@ nonisolated final class RasterSnapshot: @unchecked Sendable {
         return materialized != nil
     }
 
+    /// Makes the contiguous pixels now, throwing if they can't be made. Core Graphics asks for them through the
+    /// image's data provider, which has no way to report a failure: the image just draws as nothing. Export and save
+    /// call this first so that shows up as an error instead of a blank layer.
+    func materialize() throws {
+        guard bytes() != nil else { throw ExportError.render }
+    }
+
     private func bytes() -> UnsafeMutableRawPointer? {
         lock.lock()
         defer { lock.unlock() }
         if let materialized { return materialized.data }
-        guard let context = try? BrushRaster.context(width: width, height: height, mask: isMask) else { return nil }
+        let context: CGContext
+        do { context = try BrushRaster.context(width: width, height: height, mask: isMask) } catch {
+            if !materializeFailed {
+                materializeFailed = true
+                Self.log.error("A painted \(self.width)×\(self.height) layer's pixels could not be made, so it draws as nothing: \(String(describing: error), privacy: .public)")
+            }
+            return nil
+        }
         draw(in: CGRect(x: 0, y: 0, width: width, height: height), context: context)
         materialized = context
         return context.data
+    }
+
+    /// The raster reduced to `width` × `height` without making its contiguous pixels: a block at a time is composed
+    /// at full resolution from the base and tiles, with a margin for the resampling to reach into, and drawn reduced
+    /// into its part of the result. Asking the whole image for its bytes would keep a full-size copy for as long as
+    /// the snapshot lives, which is what the tiles are there to avoid.
+    func reduced(width: Int, height: Int) throws -> CGImage {
+        guard width > 0, height > 0 else { throw ExportError.render }
+        let output = try BrushRaster.context(width: width, height: height, mask: isMask)
+        output.clear(CGRect(x: 0, y: 0, width: width, height: height))
+        let scaleX = CGFloat(width) / CGFloat(self.width), scaleY = CGFloat(height) / CGFloat(self.height)
+        // Room for the filter's reach past each block edge, in source pixels: eight output pixels.
+        let marginX = Int(ceil(8 / min(1, scaleX))) + 2, marginY = Int(ceil(8 / min(1, scaleY))) + 2
+        // Blocks of about 2048 source pixels a side, so one never holds much more than 16 MB.
+        let stepX = max(16, Int(2048 * scaleX)), stepY = max(16, Int(2048 * scaleY))
+        // Blocks start on a multiple of 64 source pixels, so the reductions Core Graphics makes of each on the way
+        // down line up with those it would make of the whole image.
+        func start(_ output: Int, scale: CGFloat, margin: Int) -> Int {
+            max(0, (Int(floor(CGFloat(output) / scale)) - margin) / 64 * 64)
+        }
+        for y in stride(from: 0, to: height, by: stepY) {
+            let rows = min(stepY, height - y)
+            let top = start(y, scale: scaleY, margin: marginY)
+            let bottom = min(self.height, Int(ceil(CGFloat(y + rows) / scaleY)) + marginY)
+            for x in stride(from: 0, to: width, by: stepX) {
+                let columns = min(stepX, width - x)
+                let left = start(x, scale: scaleX, margin: marginX)
+                let right = min(self.width, Int(ceil(CGFloat(x + columns) / scaleX)) + marginX)
+                guard right > left, bottom > top else { continue }
+                let block = try BrushRaster.context(width: right - left, height: bottom - top, mask: isMask)
+                block.clear(CGRect(x: 0, y: 0, width: right - left, height: bottom - top))
+                block.translateBy(x: -CGFloat(left), y: -CGFloat(top))
+                draw(in: CGRect(x: 0, y: 0, width: self.width, height: self.height), context: block)
+                guard let image = block.makeImage() else { throw ExportError.render }
+                output.saveGState()
+                output.setShouldAntialias(false)
+                output.clip(to: CGRect(x: x, y: y, width: columns, height: rows))
+                output.interpolationQuality = .high
+                let target = CGRect(x: CGFloat(left) * scaleX, y: CGFloat(top) * scaleY,
+                                    width: CGFloat(right - left) * scaleX, height: CGFloat(bottom - top) * scaleY)
+                output.translateBy(x: target.minX, y: target.maxY)
+                output.scaleBy(x: 1, y: -1)
+                output.setBlendMode(.copy)
+                output.draw(image, in: CGRect(origin: .zero, size: target.size))
+                output.restoreGState()
+            }
+        }
+        guard let result = output.makeImage() else { throw ExportError.render }
+        return result
     }
 
     func thumbnail() throws -> CGImage {

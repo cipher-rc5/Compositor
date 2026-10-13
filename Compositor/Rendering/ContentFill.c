@@ -21,6 +21,7 @@ static double match(const uint8_t *pixels, size_t stride, const uint8_t *known,
     return count ? sum/count : DBL_MAX;
 }
 int content_fill(uint8_t *pixels, size_t stride, const uint8_t *mask, size_t ms, int w, int h) {
+    if(w<=0||h<=0) return 1;
     size_t n=(size_t)w*h;
     uint8_t *known=calloc(n,1), *target=calloc(n,1), *valid=calloc(n,1), *queued=calloc(n,1);
     int *donors=malloc(n*sizeof(int)), *queue=malloc(n*sizeof(int)), *chosen=malloc(n*sizeof(int));

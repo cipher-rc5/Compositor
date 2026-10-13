@@ -19,15 +19,28 @@ final class ProjectTab: Identifiable {
 @MainActor @Observable
 final class ProjectWorkspace {
     private(set) var tabs: [ProjectTab] = []
-    private(set) var selectedID: UUID
+    private(set) var selectedID: UUID {
+        // The effects panel isn't a modal that holds a switch up (its edits are ordinary layer edits), so it closes,
+        // keeping them, as its tab goes out of view. Left open, it stayed on screen bound to a tab nobody could see.
+        willSet {
+            guard newValue != selectedID else { return }
+            tabs.first { $0.id == selectedID }?.session.finishEffectsEditing(commit: true)
+        }
+    }
     var isManaging = false
+    /// A drag that could drop into a tab is over the window. Shows the strip's "New" drop slot.
+    private(set) var isDragging = false
     @ObservationIgnored weak var window: NSWindow?
     @ObservationIgnored private var nextNumber = 2
+    @ObservationIgnored private var dragEnd: Task<Void, Never>?
+    /// Snapshots unsaved tabs for crash recovery. Set by the app at launch; nil in tests that don't ask for one.
+    @ObservationIgnored var autosaver: ProjectAutosaver?
     var current: ProjectTab { tabs.first { $0.id == selectedID } ?? tabs[0] }
     var canSwitch: Bool {
         let s = current.session
-        return !isManaging && s.canStartProjectOperation && s.hueSaturation == nil && s.filterEdit == nil
-            && s.gradientEdit == nil && s.pixelMove == nil && s.colorPicker == nil
+        // A pending gradient doesn't hold up Save, but it does hold a tab switch: it would be left behind on a tab
+        // the user isn't looking at.
+        return !isManaging && s.canStartProjectOperation && s.gradientEdit == nil && s.colorPicker == nil
     }
     init() {
         let first = ProjectTab(name: "Untitled")
@@ -82,9 +95,14 @@ final class ProjectWorkspace {
         let tab = ProjectTab(name: url.deletingPathExtension().lastPathComponent)
         tab.controller.window = window
         guard await tab.controller.open(url) else { return false }
-        if tabs.count == 1, current.session.document == nil { tabs.removeAll() }
-        tab.controller.workspace = self; tabs.append(tab); selectedID = tab.id
+        adopt(tab)
         return true
+    }
+    /// Adds a tab loaded on its own, in place of the lone empty tab a launch starts with.
+    func adopt(_ tab: ProjectTab) {
+        if tabs.count == 1, current.session.document == nil { tabs.removeAll() }
+        tab.controller.workspace = self; tab.controller.window = window
+        tabs.append(tab); selectedID = tab.id
     }
     func close(_ id: UUID) async {
         guard canSwitch, let tab = tabs.first(where: { $0.id == id }) else { return }
@@ -97,6 +115,7 @@ final class ProjectWorkspace {
     func removeTab(_ id: UUID) {
         guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
         tabs.remove(at: index)
+        autosaver?.discard(id)
         if tabs.isEmpty { _ = addTab(reuseEmpty: false) }
         else if selectedID == id { selectedID = tabs[min(index, tabs.count-1)].id }
     }
@@ -114,19 +133,36 @@ final class ProjectWorkspace {
     }
     func closeWindow(_ window: NSWindow) async {
         guard await confirmQuit() else { return }
+        for tab in tabs { autosaver?.discard(tab.id) }
         tabs.removeAll(); _ = addTab(reuseEmpty: false)
         window.close()
     }
 
+    /// Waits for the project on screen to finish whatever keeps tabs from switching (a dialog, a stroke, a save).
+    /// False if it's still going after `timeout`, or the task is cancelled.
+    func waitUntilCanSwitch(timeout: Duration = .seconds(30)) async -> Bool {
+        let deadline = ContinuousClock.now + timeout
+        while !canSwitch {
+            guard ContinuousClock.now < deadline else { return false }
+            do { try await Task.sleep(for: .milliseconds(30)) } catch { return false }
+        }
+        return true
+    }
+
     /// Capture the destination before asynchronous provider loading. Dock/new-tab
     /// drops create one project per image; existing-tab drops add image layers.
-    func receive(_ urls: [URL], into destination: UUID? = nil, at point: CGPoint? = nil) async {
+    func receive(_ urls: [URL], into destination: UUID? = nil, at point: CGPoint? = nil,
+                 timeout: Duration = .seconds(30)) async {
+        // Wait before taking file access, so none is held for an edit that may never finish.
+        guard await waitUntilCanSwitch(timeout: timeout) else {
+            if !Task.isCancelled, !urls.isEmpty {
+                let names = ListFormatter.localizedString(byJoining: urls.map(\.lastPathComponent))
+                current.session.importError = "Couldn’t open \(names) while another edit is in progress. Finish it, then try again."
+            }
+            return
+        }
         let files = urls.map { ($0, $0.startAccessingSecurityScopedResource()) }
         defer { for (url, scoped) in files where scoped { url.stopAccessingSecurityScopedResource() } }
-        while !canSwitch {
-            if Task.isCancelled { return }
-            try? await Task.sleep(for: .milliseconds(30))
-        }
         isManaging = true; defer { isManaging = false }
         for url in urls {
             if url.pathExtension.lowercased() == "comp" { _ = await loadProject(url); continue }
@@ -154,6 +190,20 @@ final class ProjectWorkspace {
         }
     }
     static let layerType = "com.compositor.layer-row"
+
+    /// A drag reached one of the tab strip's drop targets. Drop targets hear nothing when a drag that merely passed
+    /// over them ends elsewhere, so this watches for the mouse button's release, and only while a drag is under way.
+    func dragDidEnter() {
+        isDragging = true
+        guard dragEnd == nil else { return }
+        dragEnd = Task { [weak self] in
+            while NSEvent.pressedMouseButtons != 0 {
+                do { try await Task.sleep(for: .milliseconds(100)) } catch { break }
+            }
+            self?.isDragging = false
+            self?.dragEnd = nil
+        }
+    }
     func copyLayer(_ id: UUID, into destination: UUID?, at point: CGPoint? = nil) async {
         guard canSwitch, let sourceTab = tabs.first(where: { $0.session.document?.layers.contains(where: { $0.id == id }) == true }),
               sourceTab.session.canEditLayers, let snapshot = sourceTab.session.projectSnapshot(),
@@ -196,7 +246,7 @@ final class ProjectWorkspace {
                 mask?.placement?.origin.x += center.x-anchor.x; mask?.placement?.origin.y += center.y-anchor.y
                 return ImageLayer(id: mapping[layer.id]!, asset: layer.asset, name: layer.name, isVisible: layer.isVisible,
                     transform: transform, parentID: layer.parentID.flatMap { mapping[$0] }, isGroup: layer.isGroup,
-                    opacity: layer.opacity, blendMode: layer.blendMode, mask: mask, maskSourceID: layer.maskSourceID.flatMap { mapping[$0] }, adjustment: layer.adjustment, shape: layer.shape, text: layer.text)
+                    opacity: layer.opacity, blendMode: layer.blendMode, mask: mask, maskSourceID: layer.maskSourceID.flatMap { mapping[$0] }, adjustment: layer.adjustment, shape: layer.shape, effects: layer.effects, text: layer.text)
             }
             target.session.isProjectBusy = false
             target.session.beginEdit("Copy Layers from Project")

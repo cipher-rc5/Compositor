@@ -68,6 +68,8 @@ nonisolated enum PSDChannelCoder {
             let hi = try next(), lo = try next()
             counts[row] = Int(hi) << 8 | Int(lo)
         }
+        // Rows the data can't hold mean a damaged channel; say so before allocating the whole plane.
+        guard counts.reduce(0, +) <= data.count - offset else { throw PSDError.truncated }
         var plane = [UInt8](repeating: 0, count: width * height)
         for row in 0..<height {
             let end = offset + counts[row]

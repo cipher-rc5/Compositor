@@ -80,7 +80,7 @@ nonisolated struct CameraRawGeometrySettings: Equatable, Sendable {
             "inputBottomRight": vector(corners[2]),
             "inputBottomLeft": vector(corners[3]),
         ])
-        var result = try PixelAdjust.render(warped, width: width, height: height, isMask: false)
+        let result = try PixelAdjust.render(warped, width: width, height: height, isMask: false)
         guard settings.constrainCrop else { return result }
         let context = try BrushRaster.context(width: width, height: height, mask: false)
         BrushRaster.draw(result, in: CGRect(x: 0, y: 0, width: width, height: height), mask: false, context: context)
@@ -131,6 +131,14 @@ nonisolated struct CameraRawGeometrySettings: Equatable, Sendable {
         return (vertical, horizontal, rotate)
     }
 
+    /// How much Scale (−100…100) enlarges the picture: twice the size at 100, half at −100. Below zero it halves
+    /// rather than shrinks by the slider's own amount, which at −100 collapsed every corner onto the center and
+    /// left a degenerate transform for OK to commit.
+    static func zoom(forScale scale: Double) -> Double {
+        let scale = ImageAdjustmentPixels.clamp(scale, toneRange, 0)
+        return scale >= 0 ? 1 + scale / 100 : 1 + scale / 200
+    }
+
     /// Core Image corner positions with y measured upward from the bottom.
     private func outputCorners(width: Int, height: Int, vertical: Double, horizontal: Double, rotation: Double) -> [CGPoint] {
         let w = Double(width), h = Double(height)
@@ -138,7 +146,7 @@ nonisolated struct CameraRawGeometrySettings: Equatable, Sendable {
         let v = vertical / 100 * w * 0.18 * strength
         let hz = horizontal / 100 * h * 0.18 * strength
         let aspectScale = 1 + aspect / 200
-        let zoom = 1 + scale / 100
+        let zoom = Self.zoom(forScale: scale)
         let shiftX = offsetX / 100 * w * 0.15
         let shiftY = offsetY / 100 * h * 0.15
         var topLeft = CGPoint(x: -v + shiftX, y: h + shiftY)

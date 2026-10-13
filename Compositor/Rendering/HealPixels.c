@@ -112,11 +112,11 @@ static void heal_solve(float *value, const uint8_t *role, long w, long h, int de
     }
 }
 
-int spot_heal(uint8_t *rgba, const uint8_t *coverage, size_t width, size_t height, size_t stride,
+int spot_heal(uint8_t *rgba, size_t stride, const uint8_t *coverage, size_t coverageStride, size_t width, size_t height,
               float opacity, int mode, uint32_t seed) {
     long W = (long)width, H = (long)height;
     long bounds[4];
-    heal_coverage_bounds(coverage, width, height, width, bounds);
+    heal_coverage_bounds(coverage, width, height, coverageStride, bounds);
     if (bounds[2] <= bounds[0]) return 0;
     long bw = bounds[2] - bounds[0], bh = bounds[3] - bounds[1], size = bw > bh ? bw : bh;
     long ring = size / 8;
@@ -134,7 +134,7 @@ int spot_heal(uint8_t *rgba, const uint8_t *coverage, size_t width, size_t heigh
     if (!role || !near || !prefix || !value) goto done;
     for (long y = 0; y < wh; ++y)
         for (long x = 0; x < ww; ++x)
-            role[y * ww + x] = coverage[(size_t)(wy0 + y) * width + (size_t)(wx0 + x)] ? HOLE : OUTSIDE;
+            role[y * ww + x] = coverage[(size_t)(wy0 + y) * coverageStride + (size_t)(wx0 + x)] ? HOLE : OUTSIDE;
     // The ring: pixels within `ring` of the spot (a square dilation, row pass then column pass).
     for (long y = 0; y < wh; ++y) {
         prefix[0] = 0;
@@ -229,7 +229,7 @@ int spot_heal(uint8_t *rgba, const uint8_t *coverage, size_t width, size_t heigh
             long ix = wx0 + x, iy = wy0 + y;
             uint8_t *t = rgba + (size_t)iy * stride + (size_t)ix * 4;
             const uint8_t *s = haveSource ? rgba + (size_t)(iy + oy) * stride + (size_t)(ix + ox) * 4 : NULL;
-            double amount = coverage[(size_t)iy * width + (size_t)ix] / 255.0 * opacity;
+            double amount = coverage[(size_t)iy * coverageStride + (size_t)ix] / 255.0 * opacity;
             double grain = 0;
             if (!haveSource) {
                 uint32_t key = heal_hash(seed ^ heal_hash((uint32_t)(iy * W + ix)));

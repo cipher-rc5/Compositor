@@ -1,5 +1,6 @@
 import AppKit
 import CoreImage
+import os
 
 /// The six color ranges plus Master, as in Photoshop's Cmd+U.
 nonisolated enum ColorRange: String, CaseIterable, Sendable, Hashable, Codable {
@@ -213,7 +214,7 @@ nonisolated struct HueSaturationSettings: Equatable, Sendable, Codable {
     }
 }
 
-nonisolated struct HueSaturationJob: @unchecked Sendable {
+nonisolated struct HueSaturationJob: Sendable {
     let image: CGImage
     let settings: HueSaturationSettings
     let selection: SelectionClip?
@@ -222,7 +223,7 @@ nonisolated struct HueSaturationJob: @unchecked Sendable {
     var thumbnail = true
 }
 
-nonisolated struct AdjustedPixels: @unchecked Sendable {
+nonisolated struct AdjustedPixels: Sendable {
     let image: CGImage
     let thumbnail: CGImage?
 }
@@ -297,7 +298,10 @@ nonisolated enum HueSaturationFilter {
         var (hue, saturation, lightness) = toHSL(red: red, green: green, blue: blue)
         var lightnessAmount = 0.0
         if settings.colorize {
+            // Wrapped like the shifted hue below: a negative hue (the slider's −180…180 before Colorize was turned on,
+            // or a file's) is that far back round the wheel, not a negative sector `toRGB` would read as red.
             hue = settings.hue.truncatingRemainder(dividingBy: 360)
+            if hue < 0 { hue += 360 }
             saturation = min(1, max(0, settings.saturation / 100))
             lightnessAmount = settings.lightness / 100
         } else {
@@ -332,12 +336,7 @@ nonisolated enum HueSaturationFilter {
         let delta = high - low
         guard delta > 0 else { return (0, 0, lightness) }
         let saturation = delta / (1 - abs(2 * lightness - 1))
-        var hue: Double
-        if high == red { hue = (green - blue) / delta }
-        else if high == green { hue = (blue - red) / delta + 2 }
-        else { hue = (red - green) / delta + 4 }
-        hue *= 60
-        if hue < 0 { hue += 360 }
+        let hue = ImageAdjustmentPixels.hueDegrees(red: red, green: green, blue: blue, grayChroma: 0)
         return (hue, min(1, saturation), lightness)
     }
 
@@ -369,10 +368,14 @@ final class HueSaturationEdit {
     let layerID: UUID
     let original: ImportedImage
     let selection: SelectionClip?
+    let transform: LayerTransform
     let pixelToDocument: CGAffineTransform
-    /// Downscaled original used for previews, with the mapping for its own pixel grid.
-    @ObservationIgnored let previewSource: CGImage
-    @ObservationIgnored let previewPixelToDocument: CGAffineTransform
+    /// Downscaled original used for previews, with the mapping for its own pixel grid. Until `setupTask` has made the
+    /// copy, these are the original itself.
+    @ObservationIgnored private(set) var previewSource: CGImage
+    @ObservationIgnored private(set) var previewPixelToDocument: CGAffineTransform
+    /// Makes the downscaled copy off the main actor when the layer is larger than `previewLimit`; previews wait for it.
+    @ObservationIgnored var setupTask: Task<Void, Never>?
     var settings = HueSaturationSettings()
     var preview = true
     /// What the canvas shows while the dialog is open; nil means the layer's own pixels.
@@ -381,27 +384,23 @@ final class HueSaturationEdit {
 
     /// Previews render at most this many pixels on the longest side: full size for anything ordinary, so the canvas
     /// shows the real thing rather than a coarse copy stretched to fit, as a Hue/Saturation layer already does.
-    static let previewLimit = 8000
+    nonisolated static let previewLimit = 8000
 
-    init(layerID: UUID, original: ImportedImage, selection: SelectionClip?, transform: LayerTransform) throws {
+    /// Reads no pixels: a layer past `previewLimit` is copied smaller by `EditorSession.prepareHueSaturation`.
+    init(layerID: UUID, original: ImportedImage, selection: SelectionClip?, transform: LayerTransform) {
         self.layerID = layerID
         self.original = original
         self.selection = selection
-        let width = original.image.width, height = original.image.height
-        pixelToDocument = BrushRaster.pixelToDocument(transform, width: width, height: height)
-        let factor = min(1, Double(Self.previewLimit) / Double(max(width, height)))
-        if factor < 1 {
-            let small = max(1, Int(Double(width) * factor)), tall = max(1, Int(Double(height) * factor))
-            let context = try BrushRaster.context(width: small, height: tall, mask: false)
-            context.interpolationQuality = .medium
-            BrushRaster.draw(original.image, in: CGRect(x: 0, y: 0, width: small, height: tall), mask: false, context: context)
-            guard let scaled = context.makeImage() else { throw ExportError.render }
-            previewSource = scaled
-            previewPixelToDocument = BrushRaster.pixelToDocument(transform, width: small, height: tall)
-        } else {
-            previewSource = original.image
-            previewPixelToDocument = pixelToDocument
-        }
+        self.transform = transform
+        pixelToDocument = BrushRaster.pixelToDocument(transform, width: original.image.width, height: original.image.height)
+        previewSource = original.image
+        previewPixelToDocument = pixelToDocument
+    }
+
+    var needsPreviewCopy: Bool { PixelAdjust.needsPreviewCopy(original.image, limit: CGFloat(Self.previewLimit)) }
+    func adopt(_ copy: PixelAdjust.PreviewCopy) {
+        previewSource = copy.image
+        previewPixelToDocument = copy.mapping
     }
 
     func previewImage(for layer: UUID) -> CGImage? { layer == layerID ? preparedPreview : nil }
@@ -422,13 +421,49 @@ extension EditorSession {
 
     func beginHueSaturation() {
         guard hueSaturation == nil, canAdjustColors else { NSSound.beep(); return }
+        // The pending gradient goes onto the layer first, as Levels and the filters do; reading the layer before its
+        // commit landed adjusted the pixels without it, and OK then found the layer changed and dropped the result.
+        if gradientEdit != nil {
+            Task { await commitGradient(); beginHueSaturation() }
+            return
+        }
         commitTransform()
-        if gradientEdit != nil { resolveGradient() }
         guard let document, let layer = activeLayer, let asset = layer.asset else { return }
         do {
-            hueSaturation = try HueSaturationEdit(layerID: layer.id, original: asset,
+            let edit = HueSaturationEdit(layerID: layer.id, original: asset,
                 selection: try selection?.clip(canvas: document.size), transform: layer.transform)
+            hueSaturation = edit
+            prepareHueSaturation(edit)
         } catch { brushError = error.localizedDescription }
+    }
+
+    /// A layer past `previewLimit` is copied smaller for previews off the main actor, so opening the panel doesn't
+    /// stall on it; previews wait for the copy. The copy is of `edit.original`, the pixels OK adjusts and checks are
+    /// still on the layer, so a layer changed meanwhile can't mix into it.
+    func prepareHueSaturation(_ edit: HueSaturationEdit) {
+        guard edit.needsPreviewCopy else { return }
+        let original = edit.original, transform = edit.transform
+        edit.setupTask = Task { @MainActor [weak self, weak edit] in
+            let copy: PixelAdjust.PreviewCopy?
+            do {
+                copy = try await PixelAdjust.detached {
+                    try PixelAdjust.previewCopy(of: original.image, limit: CGFloat(HueSaturationEdit.previewLimit), placed: transform)
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                // Previews then read the full-size layer: slower, but right.
+                self?.brushError = error.localizedDescription
+                copy = nil
+            }
+            guard let self, let edit, self.hueSaturation === edit, !Task.isCancelled else {
+                adjustmentLog.debug("A Hue/Saturation preview copy finished after its panel closed; it was discarded")
+                return
+            }
+            if let copy { edit.adopt(copy) }
+            edit.setupTask = nil
+            self.renderPendingPreview(edit)
+        }
     }
 
     /// Live preview from the downscaled original. Requests coalesce rather than cancel:
@@ -442,6 +477,7 @@ extension EditorSession {
         if previewAdjustmentEditing(preview: preview) { return }
         guard preview, !settings.isIdentity else {
             hueSaturationTask?.cancel()
+            hueSaturationTask = nil
             hueSaturationPending = nil
             edit.setPreview(nil)
             brushRevision += 1
@@ -454,11 +490,18 @@ extension EditorSession {
     }
 
     private func renderPendingPreview(_ edit: HueSaturationEdit) {
-        guard hueSaturation === edit, let job = hueSaturationPending, hueSaturationTask == nil else { return }
+        // A render cancelled along with an earlier panel no longer holds the slot. Waiting on it left a reopened panel's
+        // first change unrendered until the next slider move: it finished, found its panel gone, and started nothing.
+        guard hueSaturation === edit, edit.setupTask == nil, let pending = hueSaturationPending,
+              hueSaturationTask?.isCancelled ?? true else { return }
         hueSaturationPending = nil
+        // Read from the preview copy as it is now: one made since this was queued replaces the full-size layer.
+        let job = HueSaturationJob(image: edit.previewSource, settings: pending.settings, selection: pending.selection,
+                                   pixelToDocument: edit.previewPixelToDocument, thumbnail: false)
         hueSaturationTask = Task { @MainActor [weak self] in
             let adjusted = await self?.adjustedPixels(job)
-            guard let self else { return }
+            // Cancelled: whoever cancelled it moved on, and a newer render may already hold the slot.
+            guard let self, !Task.isCancelled else { return }
             self.hueSaturationTask = nil
             guard self.hueSaturation === edit else { return }
             if let adjusted {
@@ -479,6 +522,8 @@ extension EditorSession {
         hueTargetDrag = nil
         hueSaturationPending = nil
         hueSaturationTask?.cancel()
+        hueSaturationTask = nil
+        edit.setupTask?.cancel()
         let settings = edit.settings
         // The preview stays on screen until the committed pixels are in the document:
         // clearing it first leaves the canvas showing the original for a frame.
@@ -491,14 +536,15 @@ extension EditorSession {
         defer { isProjectBusy = false }
         let job = HueSaturationJob(image: edit.original.image, settings: settings,
                                    selection: edit.selection, pixelToDocument: edit.pixelToDocument, thumbnail: true)
-        guard let adjusted = await adjustedPixels(job),
-              let index = document?.layers.firstIndex(where: { $0.id == edit.layerID }),
-              let current = document?.layers[index], current.asset?.image === edit.original.image else { return }
+        guard let adjusted = await adjustedPixels(job) else { return }
+        guard let index = document?.layers.firstIndex(where: { $0.id == edit.layerID }),
+              let current = document?.layers[index], current.asset?.image === edit.original.image else {
+            reportDroppedApply("Hue/Saturation"); return
+        }
         beginEdit("Hue/Saturation")
-        document?.layers[index] = ImageLayer(id: current.id,
-            asset: ImportedImage(image: adjusted.image, thumbnail: adjusted.thumbnail ?? adjusted.image, name: current.name),
-            name: current.name, isVisible: current.isVisible, transform: current.transform, parentID: current.parentID,
-            isGroup: false, opacity: current.opacity, blendMode: current.blendMode, mask: current.mask, maskSourceID: current.maskSourceID)
+        document?.layers[index] = current.replacingPixels(
+            ImportedImage(image: adjusted.image, thumbnail: adjusted.thumbnail ?? adjusted.image, name: current.name),
+            mask: current.mask)
         endEdit()
     }
 
@@ -560,15 +606,23 @@ extension EditorSession {
         hueSampleMode = nil
         hueTargeting = false
         hueTargetDrag = nil
-        guard hueSaturation != nil else { return }
+        guard let edit = hueSaturation else { return }
         hueSaturationPending = nil
+        edit.setupTask?.cancel()
         hueSaturationTask?.cancel()
+        hueSaturationTask = nil
         hueSaturation = nil
         brushRevision += 1
     }
 
+    /// Nil when it failed (and says why) or was cancelled, which needs no word: the preview it was for is gone.
     private func adjustedPixels(_ job: HueSaturationJob) async -> AdjustedPixels? {
-        do { return try await Task.detached(priority: .userInitiated) { try HueSaturationFilter.run(job) }.value }
+        do {
+            return try await PixelAdjust.detached {
+                try Task.checkCancellation()
+                return try HueSaturationFilter.run(job)
+            }
+        } catch is CancellationError { return nil }
         catch { brushError = error.localizedDescription; return nil }
     }
 }

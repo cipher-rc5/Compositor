@@ -1,5 +1,40 @@
 import AppKit
 
+/// A Clone Stamp or Blur stroke whose source is still being made off the main thread. The stroke is under way —
+/// the canvas and the gates treat it as painting — but its points wait here until the source lands, then are
+/// replayed in order. Rendering the whole document on mouse-down used to hold up the first dab.
+final class BrushSampleWait {
+    let stroke: BrushStroke
+    let offset: CGSize
+    let name: String
+    var points: [CGPoint]
+    /// Mouse-up came first: commit once the source lands. The session is busy meanwhile, so the next input waits.
+    var finishes = false
+    var task: Task<Void, Never>?
+    init(stroke: BrushStroke, offset: CGSize, name: String, first: CGPoint) {
+        self.stroke = stroke
+        self.offset = offset
+        self.name = name
+        points = [first]
+    }
+}
+
+/// What a Clone Stamp or Blur stroke copies from, to render off the main thread.
+private nonisolated struct BrushSampleJob: Sendable {
+    var clone: SelectionSource?
+    var blur: BlurSampleSource?
+    func render() throws -> CGImage {
+        if let clone { return try clone.render() }
+        guard let blur else { throw ExportError.render }
+        return try blur.render()
+    }
+}
+
+private nonisolated struct BrushSampleResult: Sendable {
+    let image: CGImage?
+    let error: Error?
+}
+
 extension EditorSession {
     /// An explicitly empty selection leaves nothing paintable, so painting never starts.
     var canPaint: Bool {
@@ -29,20 +64,21 @@ extension EditorSession {
         // Spot Healing and Clone Stamp rework image pixels; they have nothing to do on a mask.
         if tool == .blur, blurMode != .blur { beginWarp(at: point); return }
         guard tool == .brush || tool == .blur || (tool.isBrushTool && !isMaskSelected), canPaint, let layer = activeLayer, let document else { return }
-        var clone: (image: CGImage, offset: CGSize)?
+        // Clone Stamp and Blur paint from a copy of the document, made off the main thread while the stroke starts.
+        var sample: (job: BrushSampleJob, offset: CGSize)?
         if tool == .cloneStamp {
             guard let offset = cloneStrokeOffset(at: point) else {
                 brushError = "Option-click where Clone Stamp should copy from first."
                 return
             }
-            guard let image = cloneSample(document) else { return }
+            guard let source = cloneSampleSource(document) else { return }
+            sample = (BrushSampleJob(clone: source), offset)
             cloneOffset = offset
-            clone = (image, offset)
         }
         // Blur paints a softened copy of the layer, in place, through the brush tip.
         if tool == .blur {
-            guard let image = blurSample(document, mask: isMaskSelected) else { return }
-            clone = (image, .zero)
+            do { sample = (BrushSampleJob(blur: try blurSource(document, mask: isMaskSelected)), .zero) }
+            catch { brushError = error.localizedDescription; return }
         }
         finishOpacityEdit()
         do {
@@ -52,10 +88,10 @@ extension EditorSession {
             settings.healingMode = spotHealingMode
             if isMaskSelected { settings.red = maskPaintWhite ? 1 : 0; settings.green = settings.red; settings.blue = settings.red }
             let stroke = try makeRasterEdit(for: layer, settings: settings)
-            stroke.clone = clone
             stroke.isBlur = tool == .blur
             brushStroke = stroke
-            try stroke.append(point)
+            if let sample { awaitSample(sample.job, offset: sample.offset, for: stroke, from: point) }
+            else { try stroke.append(point) }
             brushAnchor = point
             brushPointer = point
             lastBrushPoint = (point, layer.id, isMaskSelected)
@@ -63,9 +99,18 @@ extension EditorSession {
         } catch { cancelBrush(); brushError = error.localizedDescription }
     }
     func continueBrush(at point: CGPoint) {
-        if let warpStroke { warpStroke.append(point); lastBrushPoint?.point = point; brushRevision += 1; return }
+        if let warpStroke {
+            do { try warpStroke.append(point); lastBrushPoint?.point = point; brushRevision += 1 }
+            catch { cancelBrush(); brushError = error.localizedDescription }
+            return
+        }
         guard let brushStroke else { return }
         brushPointer = point
+        if let wait = brushSampleWait, wait.stroke === brushStroke {
+            wait.points.append(point)
+            lastBrushPoint?.point = point
+            return
+        }
         guard let painted = smoothed(point) else { return }
         do { try brushStroke.append(painted); lastBrushPoint?.point = painted; brushRevision += 1 }
         catch { cancelBrush(); brushError = error.localizedDescription }
@@ -91,6 +136,7 @@ extension EditorSession {
         return last.point
     }
     func cancelBrush() {
+        brushSampleWait = nil
         warpStroke = nil
         brushStroke = nil
         brushAnchor = nil
@@ -107,6 +153,18 @@ extension EditorSession {
         }
         guard let stroke = brushStroke else { return true }
         guard !isProjectBusy else { return false }
+        if let wait = brushSampleWait, wait.stroke === stroke {
+            // Busy before returning, so the next input event already waits for the source and the commit.
+            isProjectBusy = true
+            wait.finishes = true
+            return true
+        }
+        if stroke.settings.healing {
+            // Busy before returning, so the next input event already waits for the heal.
+            isProjectBusy = true
+            Task { await finishHealing(stroke) }
+            return true
+        }
         defer { cancelBrush() }
         do {
             // Smoothing leaves the brush short of the pointer; the stroke ends where the hand did.
@@ -115,22 +173,72 @@ extension EditorSession {
                 try stroke.append(pointer)
             }
             try stroke.flush()
-            if stroke.settings.healing { try stroke.heal() }
             if !stroke.patches.isEmpty { try commitPaintSnapshot(stroke) }
         } catch { brushError = error.localizedDescription }
         return true
     }
 
-    func finishBrush() async { finishBrushImmediately() }
+    /// Ends the stroke and returns once it is committed, Spot Healing's heal included.
+    func finishBrush() async {
+        if let stroke = brushStroke, stroke.settings.healing, !isProjectBusy { await finishHealing(stroke); return }
+        if let wait = brushSampleWait, wait.stroke === brushStroke {
+            if !wait.finishes, !finishBrushImmediately() { return }
+            await wait.task?.value
+            return
+        }
+        finishBrushImmediately()
+    }
+
+    /// Renders a Clone Stamp or Blur source off the main thread for `stroke`, which starts at `point`; its points
+    /// wait in `brushSampleWait` until the source lands (see `landSample`).
+    private func awaitSample(_ job: BrushSampleJob, offset: CGSize, for stroke: BrushStroke, from point: CGPoint) {
+        let wait = BrushSampleWait(stroke: stroke, offset: offset, name: stroke.isBlur ? "Blur" : "Clone Stamp", first: point)
+        brushSampleWait = wait
+        wait.task = Task { [weak self] in
+            let result = await Task.detached(priority: .userInitiated) { () -> BrushSampleResult in
+                do { return BrushSampleResult(image: try job.render(), error: nil) }
+                catch { return BrushSampleResult(image: nil, error: error) }
+            }.value
+            self?.landSample(result, for: wait)
+        }
+    }
+
+    /// The source is in: the stroke's waiting points are painted from it, and a stroke already let go is committed.
+    private func landSample(_ result: BrushSampleResult, for wait: BrushSampleWait) {
+        if wait.finishes { isProjectBusy = false }
+        // Cancelled, or another stroke since: nothing is left to paint from it.
+        guard brushSampleWait === wait, brushStroke === wait.stroke else {
+            ToolLog.staleResult(wait.name)
+            return
+        }
+        brushSampleWait = nil
+        guard let image = result.image else {
+            cancelBrush()
+            brushError = (result.error ?? ExportError.render).localizedDescription
+            return
+        }
+        let stroke = wait.stroke
+        stroke.clone = (image, wait.offset)
+        do {
+            for point in wait.points { try stroke.append(point) }
+            brushRevision += 1
+        } catch { cancelBrush(); brushError = error.localizedDescription; return }
+        if wait.finishes { finishBrushImmediately() }
+    }
 
     /// Install immutable tiles immediately, including the undo entry. The next
     /// stroke and other tools can start without awaiting full-image assembly.
     func commitPaintSnapshot(_ stroke: BrushStroke) throws {
         let result = try stroke.paintSnapshot()
-        guard result.transform.isValid,
-              let index = document?.layers.firstIndex(where: { $0.id == stroke.layer.id }),
+        // As `commitRasterEdit`: a result that can't be placed is reported, not dropped.
+        guard result.transform.isValid else { throw ProjectError.tooLarge }
+        // Painted from these pixels and this placement; never written over others.
+        guard let index = document?.layers.firstIndex(where: { $0.id == stroke.layer.id }),
               let current = document?.layers[index], current.asset?.image === stroke.layer.asset?.image,
-              current.transform == stroke.layer.transform else { return }
+              current.transform == stroke.layer.transform else {
+            ToolLog.staleResult(stroke.editName ?? "Brush Stroke")
+            return
+        }
         var mask = current.mask
         if !stroke.isMask, let original = mask, original.placement == nil, result.bounds != stroke.sourceRect {
             let raster = RasterSnapshot.replacing(source: original.asset, sourceRect: stroke.sourceRect,
@@ -142,16 +250,16 @@ extension EditorSession {
         if stroke.isMask {
             document?.layers[index].mask = current.mask.map { $0.replacing(result.asset) } ?? LayerMask(asset: result.asset)
         } else {
-            document?.layers[index] = ImageLayer(id: current.id, asset: result.asset, name: current.name,
-                isVisible: current.isVisible, transform: result.transform, parentID: current.parentID, isGroup: false,
-                opacity: current.opacity, blendMode: current.blendMode, mask: mask, maskSourceID: current.maskSourceID, effects: current.effects)
+            document?.layers[index] = current.replacingPixels(result.asset, transform: result.transform, mask: mask)
         }
         endEdit()
     }
 
     /// Assembles a raster edit off the main thread and replaces the layer's pixels or
-    /// mask as one undo step. Other layer properties are read at commit time.
-    func commitRasterEdit(_ stroke: BrushStroke, name: String, alsoApply: (() -> Void)? = nil) async throws {
+    /// mask as one undo step. Other layer properties are read at commit time. False when the layer changed while it
+    /// was assembled, and the result was dropped.
+    @discardableResult
+    func commitRasterEdit(_ stroke: BrushStroke, name: String, alsoApply: (() -> Void)? = nil) async throws -> Bool {
         isProjectBusy = true
         defer { isProjectBusy = false }
         guard stroke.committedTransform.isValid else { throw ProjectError.tooLarge }
@@ -169,22 +277,24 @@ extension EditorSession {
         guard let index = document?.layers.firstIndex(where: { $0.id == stroke.layer.id }),
               let current = document?.layers[index], current.asset?.image === stroke.layer.asset?.image,
               current.transform == stroke.layer.transform,
-              current.mask?.asset.image === stroke.layer.mask?.asset.image else { return }
+              current.mask?.asset.image === stroke.layer.mask?.asset.image else {
+            ToolLog.staleResult(name)
+            return false
+        }
         beginEdit(name)
         if stroke.isMask {
             document?.layers[index].mask = current.mask.map { $0.replacing(asset) } ?? LayerMask(asset: asset)
         } else {
-            document?.layers[index] = ImageLayer(id: current.id, asset: asset, name: current.name,
-                isVisible: current.isVisible, transform: transform, parentID: current.parentID, isGroup: false,
-                opacity: current.opacity, blendMode: current.blendMode,
+            document?.layers[index] = current.replacingPixels(asset, transform: transform,
                 mask: mask.map { mask -> LayerMask in
                     var kept = mask
                     kept.isEnabled = current.mask?.isEnabled ?? mask.isEnabled
                     return kept
-                }, maskSourceID: current.maskSourceID, effects: current.effects)
+                })
         }
         alsoApply?()
         endEdit()
+        return true
     }
     /// Tools where number keys set opacity: the brush or gradient opacity, or with
     /// Move/Transform the opacity of the selected layers.

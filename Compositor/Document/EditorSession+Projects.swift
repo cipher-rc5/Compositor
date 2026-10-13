@@ -17,7 +17,7 @@ extension EditorSession {
     }
 
     /// Called only after the entire package has successfully validated and loaded.
-    func installProject(_ snapshot: ProjectSnapshot, from url: URL) {
+    func installProject(_ snapshot: ProjectSnapshot, from url: URL?) {
         collapsedGroupIDs = []
         isMaskSelected = false
         cancelCrop()
@@ -25,18 +25,19 @@ extension EditorSession {
         let manifest = snapshot.manifest
         transformEdit = nil
         document = CanvasDocument(id: manifest.documentID, width: manifest.width, height: manifest.height,
-            layers: manifest.layers.map {
-                ImageLayer(id: $0.id, asset: snapshot.images[$0.id], name: $0.name,
-                           isVisible: $0.isVisible, transform: $0.transform, parentID: $0.parentID, isGroup: $0.isGroup == true, opacity: $0.opacity ?? 1, blendMode: $0.blendMode ?? .normal, mask: snapshot.mask(for: $0), maskSourceID: $0.maskSourceID, adjustment: $0.adjustment,
-                           shape: LayerShape.loaded($0.shape, image: snapshot.images[$0.id]?.image),
-                           effects: $0.effects,
-                           text: LayerText.loaded($0.text, image: snapshot.images[$0.id]?.image))
-            }, resolution: manifest.resolution ?? 72, guides: manifest.guides ?? [])
+            layers: manifest.layers.map { ImageLayer(record: $0, in: snapshot) }, resolution: manifest.resolution ?? 72, guides: manifest.guides ?? [])
         activeLayerID = manifest.activeLayerID
         projectURL = url
         renamingLayerID = nil
         history.reset()
         viewport.fit(documentSize: document!.size)
+    }
+
+    /// A crash-recovery snapshot: unsaved, with no file of its own. Saving it asks where, since the sandbox's
+    /// access to wherever it was saved before didn't outlive the launch that crashed.
+    func installRecoveredProject(_ snapshot: ProjectSnapshot) {
+        installProject(snapshot, from: nil)
+        history.markUnsaved()
     }
 
     func clearProject() {
@@ -56,5 +57,19 @@ extension EditorSession {
         guard !isProjectBusy, !isImporting, (1...30_000).contains(width), (1...30_000).contains(height) else { return }
         clearProject()
         createDocument(width: width, height: height, emptyLayer: true)
+    }
+}
+
+extension ImageLayer {
+    /// A saved layer record, with its pixels and mask from the snapshot. Opening a project and every
+    /// whole-document edit (Canvas Size, Image Size, Crop, Trim) rebuild layers through here, so what a
+    /// record carries survives both the same way.
+    init(record: ProjectLayerRecord, in snapshot: ProjectSnapshot) {
+        let image = snapshot.images[record.id]
+        self.init(id: record.id, asset: image, name: record.name, isVisible: record.isVisible, transform: record.transform,
+                  parentID: record.parentID, isGroup: record.isGroup == true, opacity: record.opacity ?? 1,
+                  blendMode: record.blendMode ?? .normal, mask: snapshot.mask(for: record), maskSourceID: record.maskSourceID,
+                  adjustment: record.adjustment, shape: LayerShape.loaded(record.shape, image: image?.image),
+                  effects: record.effects, text: LayerText.loaded(record.text, image: image?.image))
     }
 }

@@ -73,12 +73,8 @@ extension EditorSession {
         guard pixel.x >= 0, pixel.y >= 0, pixel.x < CGFloat(edit.original.image.width),
               pixel.y < CGFloat(edit.original.image.height), let sample = edit.original.image.cropping(to: rect) else { return }
         do {
-            let context = try BrushRaster.context(width: 1, height: 1, mask: false)
-            BrushRaster.draw(sample, in: CGRect(x: 0, y: 0, width: 1, height: 1), mask: false, context: context)
-            let bytes = context.data!.assumingMemoryBound(to: UInt8.self)
-            guard bytes[3] > 0 else { return }
-            let rgb = (0..<3).map { min(1, Double(bytes[$0]) / Double(bytes[3])) }
-            updateLevels(edit.settings.sampling(rgb, mode: mode), preview: edit.preview)
+            guard let rgb = try ImageAdjustmentPixels.straightColor(of: sample) else { return }
+            updateLevels(edit.settings.sampling([rgb.red, rgb.green, rgb.blue], mode: mode), preview: edit.preview)
         } catch { brushError = error.localizedDescription }
     }
 }

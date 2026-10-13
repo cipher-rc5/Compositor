@@ -126,9 +126,11 @@ nonisolated enum PSDVector {
             let keys = ["topLeft", "topRight", "bottomRight", "bottomLeft"]
             let radii = keys.compactMap { unit(data, key: $0, from: radiiAt) }
             if radii.count == 4 {
+                // A project stores one finite, non-negative radius; anything else comes in as plain pixels.
+                guard radii.allSatisfy(\.isFinite) else { return nil }
                 let lo = radii.min() ?? 0, hi = radii.max() ?? 0
                 if hi - lo > 0.5 { return nil }
-                origin.cornerRadius = CGFloat(hi)
+                origin.cornerRadius = CGFloat(max(0, hi))
             }
         }
         return origin

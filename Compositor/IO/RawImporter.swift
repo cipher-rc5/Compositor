@@ -31,6 +31,19 @@ nonisolated struct RawDevelopSettings: Equatable, Sendable {
     }
 }
 
+/// Why a RAW file didn't develop. The system decoder gives no reason of its own, so these say which step
+/// failed: opening the file at all, or producing pixels from it (where a damaged or unknown file shows up,
+/// since the filter itself opens almost anything).
+nonisolated enum RawImportError: LocalizedError, Equatable {
+    case unsupported, developFailed
+    var errorDescription: String? {
+        switch self {
+        case .unsupported: "This RAW file couldn’t be opened."
+        case .developFailed: "This RAW file couldn’t be developed. It may be damaged, or its camera isn’t supported by this version of macOS."
+        }
+    }
+}
+
 nonisolated enum RawImporter {
     /// One context for every develop: building a CIContext allocates GPU resources, and the sheet
     /// develops again on each slider move.
@@ -46,13 +59,13 @@ nonisolated enum RawImporter {
         static let shared = Queue()
         private var cached: (url: URL, limit: CGFloat, filter: CIRAWFilter)?
 
-        func develop(_ url: URL, settings: RawDevelopSettings, limit: CGFloat?) -> CGImage? {
-            guard let limit else { return try? RawImporter.develop(url, settings: settings, limit: nil) }
+        func develop(_ url: URL, settings: RawDevelopSettings, limit: CGFloat?) throws -> CGImage {
+            guard let limit else { return try RawImporter.develop(url, settings: settings, limit: nil) }
             let filter: CIRAWFilter
             if let cached, cached.url == url, cached.limit == limit {
                 filter = cached.filter
             } else {
-                guard let made = CIRAWFilter(imageURL: url) else { return nil }
+                guard let made = CIRAWFilter(imageURL: url) else { throw RawImportError.unsupported }
                 let longest = max(made.nativeSize.width, made.nativeSize.height)
                 if longest > limit {
                     made.scaleFactor = Float(limit / longest)
@@ -61,7 +74,8 @@ nonisolated enum RawImporter {
                 cached = (url, limit, made)
                 filter = made
             }
-            return RawImporter.render(filter, settings: settings)
+            guard let image = RawImporter.render(filter, settings: settings) else { throw RawImportError.developFailed }
+            return image
         }
 
         /// Lets go of the decoded frame when the sheet closes.
@@ -85,7 +99,7 @@ nonisolated enum RawImporter {
     /// The developed image. `limit` caps the long edge for the preview the sheet shows while the
     /// sliders move; the import itself passes nil and gets the full frame.
     static func develop(_ url: URL, settings: RawDevelopSettings, limit: CGFloat? = nil) throws -> CGImage {
-        guard let filter = CIRAWFilter(imageURL: url) else { throw ImageImportError.unreadable }
+        guard let filter = CIRAWFilter(imageURL: url) else { throw RawImportError.unsupported }
         filter.exposure = settings.exposure
         filter.neutralTemperature = settings.temperature
         filter.neutralTint = settings.tint
@@ -98,7 +112,7 @@ nonisolated enum RawImporter {
                 filter.isDraftModeEnabled = true
             }
         }
-        guard let image = render(filter, settings: settings) else { throw ImageImportError.unreadable }
+        guard let image = render(filter, settings: settings) else { throw RawImportError.developFailed }
         return image
     }
 
@@ -111,6 +125,14 @@ nonisolated enum RawImporter {
         guard let output = filter.outputImage else { return nil }
         return context.createCGImage(output, from: output.extent, format: .RGBA8,
                                      colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
+    }
+
+    /// The developed frame held to the project limits: 30,000 pixels a side, and what is left of the
+    /// 100-megapixel budget once `usedPixels` are counted. `pixelSize` reads the file's header, which need
+    /// not match what the decoder produces (or the file may have changed while the sheet was up).
+    static func checkDeveloped(_ image: CGImage, usedPixels: Int) throws {
+        guard image.width <= 30_000, image.height <= 30_000,
+              image.width * image.height <= 100_000_000 - usedPixels else { throw ImageImportError.tooLarge }
     }
 
     /// The frame's size without developing it, so an oversized file is refused before the work.

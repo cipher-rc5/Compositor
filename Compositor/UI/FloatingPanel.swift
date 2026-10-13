@@ -32,6 +32,14 @@ final class FloatingPanelController: NSObject, NSWindowDelegate {
         identifier = NSUserInterfaceItemIdentifier(name)
     }
 
+    /// The panel outlives its controller unless taken down with it: an editor rebuilt for another tab would otherwise
+    /// leave the old panel on screen, wired to a session nobody is looking at.
+    isolated deinit {
+        removeFrameObserver()
+        panel?.delegate = nil
+        panel?.orderOut(nil)
+    }
+
     func show(title: String, content: some View, placement: FloatingPanelPlacement = .automatic) {
         self.placement = placement
         let panel = self.panel ?? makePanel()
@@ -143,9 +151,12 @@ final class FloatingPanelController: NSObject, NSWindowDelegate {
         removeFrameObserver()
         guard let window = documentWindow() else { return }
         dockedWindow = window
-        let follow = { [weak self] (_: Notification) in
-            guard let self, let panel = self.panel, panel.isVisible, self.placement == .dockedToMainWindowRight else { return }
-            self.applyDockedFrame(panel: panel)
+        // Delivered on the main queue (see `queue: .main` below).
+        let follow: @Sendable (Notification) -> Void = { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, let panel = self.panel, panel.isVisible, self.placement == .dockedToMainWindowRight else { return }
+                self.applyDockedFrame(panel: panel)
+            }
         }
         for name in [NSWindow.didResizeNotification, NSWindow.didMoveNotification] {
             frameObservers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: .main, using: follow))

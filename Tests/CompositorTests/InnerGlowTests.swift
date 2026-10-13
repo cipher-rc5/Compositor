@@ -178,8 +178,9 @@ import Testing
         #expect(foundGlow)
     }
 
-    @Test func innerGlowCPUAndMetalParity() throws {
-        guard let metal = MetalLayerEffects.shared else { return }
+    @Test(.enabled(if: MetalLayerEffects.shared != nil, "needs a Metal device"))
+    func innerGlowCPUAndMetalParity() throws {
+        let metal = try #require(MetalLayerEffects.shared)
 
         let source = try solidSquare(size: 40, color: PaletteColor(red: 0.1, green: 0.1, blue: 0.1))
         var glow = InnerGlowEffect()

@@ -35,8 +35,10 @@ nonisolated enum MagicWand {
     /// at `point`. Nil when nothing matches or the point is outside the image.
     static func select(in image: CGImage, at point: CGPoint, settings: WandSettings) throws -> CGPath? {
         let width = image.width, height = image.height
+        // Finite before converting: Int(_:) traps on NaN and infinity.
+        guard point.x.isFinite, point.y.isFinite else { return nil }
         let x = Int(point.x.rounded(.down)), y = Int(point.y.rounded(.down))
-        guard point.x.isFinite, point.y.isFinite, (0..<width).contains(x), (0..<height).contains(y) else { return nil }
+        guard (0..<width).contains(x), (0..<height).contains(y) else { return nil }
         let context = try BrushRaster.context(width: width, height: height, mask: false)
         BrushRaster.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height), mask: false, context: context)
         guard let data = context.data else { throw ExportError.render }
@@ -80,12 +82,13 @@ nonisolated enum MagicWand {
     }
 }
 
-private nonisolated struct WandJob: @unchecked Sendable {
-    let image: CGImage
+private nonisolated struct WandJob: Sendable {
+    let source: SelectionSource
     let point: CGPoint
     let settings: WandSettings
 }
 
+/// Unchecked only because CGPath isn't marked Sendable: the path is made by the trace and never mutated afterwards.
 private nonisolated struct WandResult: @unchecked Sendable {
     let path: CGPath?
     let error: Error?
@@ -98,16 +101,16 @@ extension EditorSession {
     func magicWand(at point: CGPoint, mode: SelectionMode) async {
         guard canEditSelection, !isProjectBusy, selectionMoveOrigin == nil, let document,
               point.x >= 0, point.y >= 0, point.x < document.size.width, point.y < document.size.height,
-              let sample = selectionSample(document, sampleAllLayers: wandSettings.sampleAllLayers) else { return }
-        let job = WandJob(image: sample, point: point, settings: wandSettings)
+              let source = selectionSource(document, sampleAllLayers: wandSettings.sampleAllLayers) else { return }
+        let job = WandJob(source: source, point: point, settings: wandSettings)
         isProjectBusy = true
         let result = await Task.detached(priority: .userInitiated) { () -> WandResult in
-            do { return WandResult(path: try MagicWand.select(in: job.image, at: job.point, settings: job.settings), error: nil) }
+            do { return WandResult(path: try MagicWand.select(in: try job.source.render(), at: job.point, settings: job.settings), error: nil) }
             catch { return WandResult(path: nil, error: error) }
         }.value
         isProjectBusy = false
         if let error = result.error { brushError = error.localizedDescription; return }
-        guard self.document?.id == document.id else { return }
+        guard self.document?.id == document.id else { ToolLog.staleResult("Magic Wand"); return }
         guard let path = result.path else {
             // Nothing matched: New clears the selection, as a lasso click enclosing nothing does.
             if mode == .replace { deselect() }
@@ -124,15 +127,29 @@ extension EditorSession {
 
     /// What selection-from-image tools read, at document size: every visible layer as shown on the canvas,
     /// or just the active layer's own pixels (without its mask, as Cmd-click selection reads them).
-    /// A folder or blank layer reads as transparent.
-    func selectionSample(_ document: CanvasDocument, sampleAllLayers: Bool) -> CGImage? {
-        guard let context = try? BrushRaster.context(width: document.width, height: document.height, mask: false) else { return nil }
-        if sampleAllLayers {
-            drawLiveComposite(document, in: context)
-        } else if let layer = activeLayer, !layer.isGroup, let image = layer.asset?.image {
-            let transform = displayedTransform(for: layer)
-            LayerRenderer.draw(image, transform: transform, center: transform.center, in: context)
+    /// A folder or blank layer reads as transparent. Captured now; drawn by `render`, off the main thread.
+    func selectionSource(_ document: CanvasDocument, sampleAllLayers: Bool) -> SelectionSource? {
+        guard document.width > 0, document.height > 0 else { return nil }
+        if sampleAllLayers { return SelectionSource(width: document.width, height: document.height, composite: liveComposite(document)) }
+        guard let layer = activeLayer, !layer.isGroup, let image = layer.asset?.image else {
+            return SelectionSource(width: document.width, height: document.height)
         }
-        return context.makeImage()
+        return SelectionSource(width: document.width, height: document.height, layer: (image, displayedTransform(for: layer)))
+    }
+}
+
+/// What a selection-from-image tool reads (see `EditorSession.selectionSource`), ready to draw on any thread.
+nonisolated struct SelectionSource: Sendable {
+    let width: Int
+    let height: Int
+    var composite: LiveComposite?
+    var layer: (image: CGImage, transform: LayerTransform)?
+
+    func render() throws -> CGImage {
+        if let composite { return try composite.render() }
+        let context = try BrushRaster.context(width: width, height: height, mask: false)
+        if let layer { LayerRenderer.draw(layer.image, transform: layer.transform, center: layer.transform.center, in: context) }
+        guard let image = context.makeImage() else { throw ExportError.render }
+        return image
     }
 }

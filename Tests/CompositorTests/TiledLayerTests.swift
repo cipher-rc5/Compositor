@@ -239,9 +239,9 @@ struct TiledLayerTests {
         struct Snapshot { let bytes: [UInt8]; let width: Int; let height: Int; let rowBytes: Int; let samples: Int }
         func snapshot() throws -> Snapshot {
             view.synchronizeDisplay()
-            let rep = try #require(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+            guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { throw CocoaError(.featureUnsupported) }
             view.cacheDisplay(in: view.bounds, to: rep)
-            let data = try #require(rep.bitmapData)
+            guard let data = rep.bitmapData else { throw CocoaError(.featureUnsupported) }
             return Snapshot(bytes: Array(UnsafeBufferPointer(start: data, count: rep.bytesPerRow * rep.pixelsHigh)),
                             width: rep.pixelsWide, height: rep.pixelsHigh, rowBytes: rep.bytesPerRow, samples: rep.bitsPerPixel / 8)
         }

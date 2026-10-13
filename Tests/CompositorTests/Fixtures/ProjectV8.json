@@ -1,0 +1,216 @@
+{
+  "format": "com.compositor.project",
+  "version": 8,
+  "colorSpace": "sRGB",
+  "documentID": "8B000000-0000-4000-8000-0000000000D8",
+  "width": 10,
+  "height": 10,
+  "activeLayerID": "8B000000-0000-4000-8000-000000000003",
+  "guides": [
+    {
+      "id": "8B000000-0000-4000-8000-0000000000A1",
+      "axis": "horizontal",
+      "position": 2.5
+    },
+    {
+      "id": "8B000000-0000-4000-8000-0000000000A2",
+      "axis": "vertical",
+      "position": -4
+    }
+  ],
+  "layers": [
+    {
+      "id": "8B000000-0000-4000-8000-000000000001",
+      "name": "Photo",
+      "isVisible": true,
+      "transform": {
+        "origin": [
+          0,
+          0
+        ],
+        "size": [
+          10,
+          10
+        ],
+        "rotation": 0,
+        "flipX": false,
+        "flipY": false,
+        "sampling": "High quality"
+      },
+      "imageFile": "8B000000-0000-4000-8000-000000000001.png",
+      "maskFile": "8B000000-0000-4000-8000-000000000001.mask.png",
+      "maskPlacement": {
+        "origin": [
+          2,
+          3
+        ],
+        "size": [
+          5,
+          5
+        ],
+        "rotation": 0,
+        "flipX": false,
+        "flipY": false,
+        "sampling": "High quality"
+      },
+      "maskLinked": false
+    },
+    {
+      "id": "8B000000-0000-4000-8000-000000000002",
+      "name": "Dimmed",
+      "isVisible": true,
+      "transform": {
+        "origin": [
+          0,
+          0
+        ],
+        "size": [
+          10,
+          10
+        ],
+        "rotation": 0,
+        "flipX": false,
+        "flipY": false,
+        "sampling": "High quality"
+      },
+      "isGroup": true,
+      "opacity": 0.5
+    },
+    {
+      "id": "8B000000-0000-4000-8000-000000000003",
+      "name": "Levels 1",
+      "isVisible": true,
+      "transform": {
+        "origin": [
+          0,
+          0
+        ],
+        "size": [
+          10,
+          10
+        ],
+        "rotation": 0,
+        "flipX": false,
+        "flipY": false,
+        "sampling": "High quality"
+      },
+      "parentID": "8B000000-0000-4000-8000-000000000002",
+      "adjustment": {
+        "kind": "Levels",
+        "hue": 0,
+        "saturation": 0,
+        "lightness": 0,
+        "colorize": false,
+        "levels": {
+          "channel": "RGB",
+          "ranges": [
+            {
+              "black": 10,
+              "gamma": 1.5,
+              "white": 245,
+              "outputBlack": 0,
+              "outputWhite": 255
+            },
+            {
+              "black": 0,
+              "gamma": 1,
+              "white": 255,
+              "outputBlack": 0,
+              "outputWhite": 255
+            },
+            {
+              "black": 0,
+              "gamma": 1,
+              "white": 255,
+              "outputBlack": 0,
+              "outputWhite": 255
+            },
+            {
+              "black": 0,
+              "gamma": 1,
+              "white": 255,
+              "outputBlack": 0,
+              "outputWhite": 255
+            }
+          ]
+        },
+        "curves": {
+          "channel": "RGB",
+          "channels": [
+            [
+              {
+                "x": 0,
+                "y": 0
+              },
+              {
+                "x": 255,
+                "y": 255
+              }
+            ],
+            [
+              {
+                "x": 0,
+                "y": 0
+              },
+              {
+                "x": 255,
+                "y": 255
+              }
+            ],
+            [
+              {
+                "x": 0,
+                "y": 0
+              },
+              {
+                "x": 255,
+                "y": 255
+              }
+            ],
+            [
+              {
+                "x": 0,
+                "y": 0
+              },
+              {
+                "x": 255,
+                "y": 255
+              }
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "id": "8B000000-0000-4000-8000-000000000004",
+      "name": "Stroked",
+      "isVisible": true,
+      "transform": {
+        "origin": [
+          4,
+          4
+        ],
+        "size": [
+          3,
+          3
+        ],
+        "rotation": 0,
+        "flipX": false,
+        "flipY": false,
+        "sampling": "High quality"
+      },
+      "imageFile": "8B000000-0000-4000-8000-000000000004.png",
+      "parentID": "8B000000-0000-4000-8000-000000000002",
+      "effects": {
+        "stroke": {
+          "size": 2,
+          "red": 1,
+          "green": 0,
+          "blue": 0,
+          "opacity": 1,
+          "inside": false
+        }
+      }
+    }
+  ]
+}

@@ -1,6 +1,7 @@
 import AppKit
 import CoreImage
 import Observation
+import os
 
 /// Filters from the Filter menu. Each runs on the active image layer, inside the selection if
 /// there is one, with a live preview and one undo step on OK.
@@ -86,14 +87,14 @@ nonisolated struct FilterSettings: Equatable, Sendable {
     }
 }
 
-nonisolated struct FilterJob: @unchecked Sendable {
+nonisolated struct FilterJob: Sendable {
     let kind: FilterKind
-    let image: CGImage
+    var image: CGImage
     let settings: FilterSettings
     /// Pixels in `image` per original layer pixel, so a downscaled preview blurs proportionally less.
-    let scale: CGFloat
+    var scale: CGFloat
     let selection: SelectionClip?
-    let mapping: CGAffineTransform
+    var mapping: CGAffineTransform
     /// Add Noise's random pattern: the same seed gives the same grain.
     var seed: UInt32 = 0
     /// Canvas-space origin used by live adjustment layers so partial redraws keep one noise field.
@@ -197,6 +198,18 @@ nonisolated enum PixelFilter {
     }
 }
 
+/// A layer's pixels padded out into a larger grid, the transform placing it, and what a filter and its preview read.
+nonisolated struct GrownGrid: Sendable {
+    let image: CGImage
+    let transform: LayerTransform
+    /// How far the grid reaches beyond the layer on every side, in layer pixels.
+    let margin: CGFloat
+    let mapping: CGAffineTransform
+    let previewSource: CGImage
+    let previewScale: CGFloat
+    let previewMapping: CGAffineTransform
+}
+
 @Observable
 final class FilterEdit {
     let kind: FilterKind
@@ -272,26 +285,35 @@ final class FilterEdit {
     @ObservationIgnored var preparedSettings: FilterSettings?
     @ObservationIgnored var pending: FilterJob?
     @ObservationIgnored var previewTask: Task<Void, Never>?
+    /// White Balance > Auto's scan of the layer, cancelled with the panel.
+    @ObservationIgnored var whiteBalanceTask: Task<Void, Never>?
+    /// Content-Aware Fill's selection past the layer's edge, in layer pixels, until the grid covering it is made.
+    @ObservationIgnored private(set) var pendingArea: CGRect?
+    /// Previews read the full-size layer until the first one has made the smaller copy `prepared` describes.
+    @ObservationIgnored private(set) var awaitsPreviewCopy: Bool
     /// Previews render from a copy no larger than this on its longest side.
-    static let previewLimit: CGFloat = 2048
+    nonisolated static let previewLimit: CGFloat = 2048
 
     /// `growingTo`: a document area the layer's grid should cover (Content-Aware Fill's selection on the canvas).
-    /// A blur grows the grid by its own reach instead, and again if its amount is raised.
+    /// A blur grows the grid by its own reach instead, and again if its amount is raised. Nothing here reads the
+    /// layer's pixels: the padded grid and the smaller preview copy are made with the first preview, off the main
+    /// actor, so opening the panel on a large layer doesn't stall. Until then previews read the layer as it is.
     init(kind: FilterKind, layer: ImageLayer, selection: SelectionClip?, settings: FilterSettings, growingTo area: CGRect? = nil) throws {
         guard let asset = layer.asset else { throw ProjectError.invalid }
         self.kind = kind
         self.settings = settings.normalized
         layerID = layer.id; original = asset; transform = layer.transform; self.selection = selection
-        let ready = try Self.prepared(kind: kind, from: asset.image, placed: layer.transform)
-        mapping = ready.mapping
-        previewSource = ready.previewSource
-        previewScale = ready.previewScale
-        previewMapping = ready.previewMapping
+        let mapping = BrushRaster.pixelToDocument(layer.transform, width: asset.image.width, height: asset.image.height)
+        self.mapping = mapping
+        previewSource = asset.image
+        previewScale = 1
+        previewMapping = mapping
+        awaitsPreviewCopy = !Self.previewsAtFullSize(kind) && PixelAdjust.needsPreviewCopy(asset.image, limit: Self.previewLimit)
         if let area {
-            let toPixels = BrushRaster.pixelToDocument(layer.transform, width: asset.image.width, height: asset.image.height).inverted()
-            try grow(to: area.applying(toPixels).integral)
+            let extent = area.applying(mapping.inverted()).integral
+            let bounds = CGRect(x: 0, y: 0, width: asset.image.width, height: asset.image.height)
+            if bounds.union(extent).integral != bounds { pendingArea = extent }
         }
-        try growForBlur()
     }
 
     /// The room a blur needs around the layer: about three standard deviations, or half a streak.
@@ -303,20 +325,48 @@ final class FilterEdit {
         }
     }
 
-    /// Pads the layer out so the blur has somewhere to spread; only ever grows, so easing the amount back off
-    /// doesn't rebuild anything.
-    func growForBlur() throws {
+    /// The grid (layer pixels) a blur at the current amount needs, when the one it has is too small. The grid only
+    /// ever grows, so easing the amount back off doesn't rebuild anything.
+    var blurExtent: CGRect? {
         let margin = Self.blurMargin(kind, settings)
-        guard margin > grownMargin else { return }
+        guard margin > grownMargin else { return nil }
         let bounds = CGRect(x: 0, y: 0, width: original.image.width, height: original.image.height)
-        try grow(to: bounds.insetBy(dx: -margin.rounded(.up), dy: -margin.rounded(.up)))
+        return bounds.insetBy(dx: -margin.rounded(.up), dy: -margin.rounded(.up))
     }
 
-    /// The layer's pixels drawn into a grid covering `extent` (layer pixels), with the transform that places it.
-    private func grow(to extent: CGRect) throws {
+    /// The grid the filter still needs made: Content-Aware Fill's selection, or the room a blur's amount needs.
+    var pendingExtent: CGRect? { pendingArea ?? blurExtent }
+
+    /// Switches the filter and its preview over to a grid made by `grown`.
+    func adopt(_ grid: GrownGrid) {
+        grownImage = grid.image
+        grownTransform = grid.transform
+        grownMargin = grid.margin
+        mapping = grid.mapping
+        previewSource = grid.previewSource
+        previewScale = grid.previewScale
+        previewMapping = grid.previewMapping
+        pendingArea = nil
+        awaitsPreviewCopy = false
+    }
+
+    /// Previews switch to the smaller copy of the layer made by `prepared`.
+    func adopt(_ copy: PixelAdjust.PreviewCopy) {
+        guard awaitsPreviewCopy else { return }
+        previewSource = copy.image
+        previewScale = copy.scale
+        previewMapping = copy.mapping
+        awaitsPreviewCopy = false
+    }
+
+    /// The layer's pixels drawn into a grid covering `extent` (layer pixels), with the transform that places it; nil
+    /// when the layer already covers it. Nonisolated: dragging a blur's amount up pads the full-size layer off the
+    /// main actor (see `renderFilterPreview`).
+    nonisolated static func grown(kind: FilterKind, original: ImportedImage, transform: LayerTransform,
+                                  to extent: CGRect) throws -> GrownGrid? {
         let bounds = CGRect(x: 0, y: 0, width: original.image.width, height: original.image.height)
         let target = bounds.union(extent).integral
-        guard target != bounds else { return }
+        guard target != bounds else { return nil }
         guard target.width <= 30_000, target.height <= 30_000, target.width * target.height <= 100_000_000 else { throw ProjectError.tooLarge }
         let context = try BrushRaster.context(width: Int(target.width), height: Int(target.height), mask: false)
         let inside = bounds.offsetBy(dx: -target.minX, dy: -target.minY)
@@ -329,35 +379,27 @@ final class FilterEdit {
                                height: target.height * transform.size.height / bounds.height)
         let middle = CGPoint(x: target.midX, y: target.midY).applying(toDocument)
         expanded.origin = CGPoint(x: middle.x - expanded.size.width / 2, y: middle.y - expanded.size.height / 2)
-        grownImage = image
-        grownTransform = expanded
-        grownMargin = min(bounds.minX - target.minX, bounds.minY - target.minY,
-                          target.maxX - bounds.maxX, target.maxY - bounds.maxY)
-        try prepare(from: image, placed: expanded)
+        let margin = min(bounds.minX - target.minX, bounds.minY - target.minY,
+                         target.maxX - bounds.maxX, target.maxY - bounds.maxY)
+        let ready = try prepared(kind: kind, from: image, placed: expanded)
+        return GrownGrid(image: image, transform: expanded, margin: margin, mapping: ready.mapping,
+                         previewSource: ready.previewSource, previewScale: ready.previewScale, previewMapping: ready.previewMapping)
+    }
+
+    /// Noise and grain preview at full size: grain made on a smaller copy would look coarser once enlarged.
+    nonisolated static func previewsAtFullSize(_ kind: FilterKind) -> Bool {
+        [.addNoise, .grain, .contentAwareFill, .removeBackground].contains(kind)
     }
 
     /// What the filter and its preview read: the full-size grid, and a copy no larger than `previewLimit` for
     /// everything but the filters that must be made at full size.
-    private static func prepared(kind: FilterKind, from source: CGImage, placed: LayerTransform) throws
+    nonisolated static func prepared(kind: FilterKind, from source: CGImage, placed: LayerTransform) throws
         -> (mapping: CGAffineTransform, previewSource: CGImage, previewScale: CGFloat, previewMapping: CGAffineTransform) {
         let mapping = BrushRaster.pixelToDocument(placed, width: source.width, height: source.height)
-        // Noise and grain preview at full size: grain made on a smaller copy would look coarser once enlarged.
-        let factor = [.addNoise, .grain, .contentAwareFill, .removeBackground].contains(kind)
-            ? 1 : min(1, previewLimit / CGFloat(max(source.width, source.height)))
-        guard factor < 1 else { return (mapping, source, 1, mapping) }
-        let w = max(1, Int(CGFloat(source.width) * factor)), h = max(1, Int(CGFloat(source.height) * factor))
-        let context = try BrushRaster.context(width: w, height: h, mask: false)
-        BrushRaster.draw(source, in: CGRect(x: 0, y: 0, width: w, height: h), mask: false, context: context)
-        guard let small = context.makeImage() else { throw ExportError.render }
-        return (mapping, small, CGFloat(w) / CGFloat(source.width),
-                BrushRaster.pixelToDocument(placed, width: w, height: h))
-    }
-    private func prepare(from source: CGImage, placed: LayerTransform) throws {
-        let ready = try Self.prepared(kind: kind, from: source, placed: placed)
-        mapping = ready.mapping
-        previewSource = ready.previewSource
-        previewScale = ready.previewScale
-        previewMapping = ready.previewMapping
+        guard !previewsAtFullSize(kind), let copy = try PixelAdjust.previewCopy(of: source, limit: previewLimit, placed: placed) else {
+            return (mapping, source, 1, mapping)
+        }
+        return (mapping, copy.image, copy.scale, copy.mapping)
     }
 
     func previewImage(for id: UUID) -> CGImage? { preview && id == layerID ? preparedPreview : nil }
@@ -418,11 +460,7 @@ extension EditorSession {
         guard let edit = filterEdit, !edit.committing else { return }
         edit.settings = settings.normalized
         edit.preview = preview
-        // A bigger blur needs more room around the layer than it was given.
-        if FilterEdit.blurMargin(edit.kind, edit.settings) > edit.grownMargin {
-            do { try edit.growForBlur(); edit.preparedPreview = nil }
-            catch { brushError = error.localizedDescription }
-        }
+        // A bigger blur needs more room around the layer than it was given; the preview render (or OK) makes it.
         if previewAdjustmentEditing(preview: preview) { return }
         if edit.kind.isAutomatic, edit.preparedPreview != nil, edit.preparedSettings == edit.settings { brushRevision += 1; return }
         guard preview else {
@@ -436,28 +474,64 @@ extension EditorSession {
     /// Renders the newest settings; changes that arrive mid-render wait for it rather than
     /// cancelling it, so dragging a slider keeps the canvas updating.
     private func renderFilterPreview(_ edit: FilterEdit) {
-        guard filterEdit === edit, edit.previewTask == nil, let job = edit.pending else { return }
+        guard filterEdit === edit, edit.previewTask == nil, var queued = edit.pending else { return }
         edit.pending = nil
         edit.preparing = true
         edit.previewError = nil
+        // The job reads what previews read now, which a grid or copy made since it was queued may have replaced.
+        queued.image = edit.previewSource; queued.scale = edit.previewScale; queued.mapping = edit.previewMapping
+        let job = queued
+        // A blur raised past its room pads the full-size layer first, in the same background work as the preview, so
+        // a drag never stalls the main actor and the bigger grid and its preview reach the canvas together. The first
+        // preview makes Content-Aware Fill's grid, or the smaller copy later previews read, the same way.
+        let extent = edit.pendingExtent, forArea = edit.pendingArea != nil, copies = edit.awaitsPreviewCopy
+        let kind = edit.kind, original = edit.original, transform = edit.transform
         edit.previewTask = Task { @MainActor [weak self, weak edit] in
-            let result = await Task.detached(priority: .userInitiated) { () -> (CGImage?, CameraRawScope?, String?) in
-                do {
-                    if job.kind == .cameraRaw {
-                        let made = try CameraRawScope.preview(job)
-                        return (made.image, made.scope, nil)
+            let result: (image: CGImage?, scope: CameraRawScope?, error: String?, grid: GrownGrid?, copy: PixelAdjust.PreviewCopy?)
+            do {
+                result = try await PixelAdjust.detached { () throws -> (CGImage?, CameraRawScope?, String?, GrownGrid?, PixelAdjust.PreviewCopy?) in
+                    // Without the room (a grid past the size limit), the blur previews in the grid it has and says why.
+                    var job = job, grid: GrownGrid?, copy: PixelAdjust.PreviewCopy?, problem: String?
+                    if let extent {
+                        do { grid = try FilterEdit.grown(kind: kind, original: original, transform: transform, to: extent) }
+                        catch { problem = error.localizedDescription }
+                        try Task.checkCancellation()
+                        // Content-Aware Fill can't run in a grid that doesn't reach its selection.
+                        if forArea, let problem { return (nil, nil, problem, nil, nil) }
+                    } else if copies {
+                        // Without the copy, this preview and the next read the full-size layer: slower, but right.
+                        do { copy = try PixelAdjust.previewCopy(of: original.image, limit: FilterEdit.previewLimit, placed: transform) }
+                        catch { problem = error.localizedDescription }
+                        try Task.checkCancellation()
                     }
-                    return (try PixelFilter.run(job), nil, nil)
-                } catch {
-                    return (nil, nil, error.localizedDescription)
+                    if let grid { job.image = grid.previewSource; job.scale = grid.previewScale; job.mapping = grid.previewMapping }
+                    else if let copy { job.image = copy.image; job.scale = copy.scale; job.mapping = copy.mapping }
+                    do {
+                        if job.kind == .cameraRaw {
+                            let made = try CameraRawScope.preview(job)
+                            return (made.image, made.scope, problem, grid, copy)
+                        }
+                        return (try PixelFilter.run(job), nil, problem, grid, copy)
+                    } catch let cancelled as CancellationError {
+                        throw cancelled
+                    } catch {
+                        return (nil, nil, error.localizedDescription, grid, copy)
+                    }
                 }
-            }.value
-            guard let self, let edit, self.filterEdit === edit, !Task.isCancelled else { return }
+            } catch {
+                return // Cancelled: the panel closed or OK took over, and nothing is waiting for this preview.
+            }
+            guard let self, let edit, self.filterEdit === edit, !Task.isCancelled else {
+                adjustmentLog.debug("A filter preview finished after its panel closed; it was discarded")
+                return
+            }
             edit.previewTask = nil
             edit.preparing = false
-            edit.previewError = result.2
-            if let scope = result.1 { edit.cameraRawScope = scope }
-            if edit.preview || edit.kind.isAutomatic { edit.preparedPreview = result.0; edit.preparedSettings = job.settings; self.brushRevision += 1 }
+            edit.previewError = result.error
+            if let grid = result.grid, forArea || grid.margin > edit.grownMargin { edit.adopt(grid) }
+            if let copy = result.copy { edit.adopt(copy) }
+            if let scope = result.scope { edit.cameraRawScope = scope }
+            if edit.preview || edit.kind.isAutomatic { edit.preparedPreview = result.image; edit.preparedSettings = job.settings; self.brushRevision += 1 }
             self.renderFilterPreview(edit)
         }
     }
@@ -468,6 +542,7 @@ extension EditorSession {
         if finishAdjustmentEditing(commit: false) { return }
         guard let edit = filterEdit, !edit.committing else { return }
         edit.previewTask?.cancel()
+        edit.whiteBalanceTask?.cancel()
         filterEdit = nil
         brushRevision += 1
     }
@@ -492,6 +567,7 @@ extension EditorSession {
             || (edit.kind == .cameraRaw && rendered.cameraRaw.isIdentity) { cancelFilter(); return }
         edit.committing = true
         edit.previewTask?.cancel()
+        edit.whiteBalanceTask?.cancel()
         if edit.kind != .cameraRaw { filterSettings = edit.settings }
         isProjectBusy = true
         // The preview stays up until the result is on the layer, so the canvas never flashes the original.
@@ -499,13 +575,29 @@ extension EditorSession {
         // Remove Background masks the background out rather than erasing it, so it can be brought back at any time
         // by painting the mask, disabling it, or deleting it.
         if edit.kind == .removeBackground { await commitBackgroundMask(edit); return }
-        let job = FilterJob(kind: edit.kind, image: edit.grownImage ?? edit.original.image, settings: edit.renderSettings(), scale: 1,
+        var job = FilterJob(kind: edit.kind, image: edit.grownImage ?? edit.original.image, settings: edit.renderSettings(), scale: 1,
                             selection: edit.selection, mapping: edit.mapping, seed: edit.seed)
         let cached = edit.kind.isAutomatic && edit.preparedSettings == edit.settings ? edit.preparedPreview : nil
         do {
+            // A blur raised just before OK may not have its room yet (the preview making it was cancelled above), and
+            // Content-Aware Fill may not have its grid.
+            if let extent = edit.pendingExtent {
+                let kind = edit.kind, original = edit.original, transform = edit.transform, forArea = edit.pendingArea != nil
+                let made: GrownGrid?
+                do { made = try await PixelAdjust.detached({ try FilterEdit.grown(kind: kind, original: original, transform: transform, to: extent) }) }
+                catch where !forArea {
+                    // Past the size limit a blur stays in the grid it has, as its preview did and said.
+                    adjustmentLog.notice("\(kind.rawValue, privacy: .public) applied without more room: \(error.localizedDescription, privacy: .public)")
+                    made = nil
+                }
+                if let grid = made {
+                    edit.adopt(grid)
+                    job.image = grid.image; job.mapping = grid.mapping
+                }
+            }
             let grown = edit.grownTransform
             let spreads = edit.kind == .gaussianBlur || edit.kind == .motionBlur
-            let made = try await Task.detached(priority: .userInitiated) { () -> (asset: ImportedImage, transform: LayerTransform?) in
+            let made = try await Task.detached(priority: .userInitiated) { [job] () -> (asset: ImportedImage, transform: LayerTransform?) in
                 var image = try cached ?? PixelFilter.run(job)
                 var placed = grown
                 if spreads, let grown {
@@ -518,21 +610,20 @@ extension EditorSession {
             let asset = made.asset
             guard let index = document?.layers.firstIndex(where: { $0.id == edit.layerID }),
                   let current = document?.layers[index], current.asset?.image === edit.original.image,
-                  current.transform == edit.transform else { return }
+                  current.transform == edit.transform else { reportDroppedApply(edit.kind.rawValue); return }
             // A grown layer's mask (covering the old grid) is carried onto the new one, its edge tone past the old edge.
+            // It goes where the pixels went: a blur's grid is trimmed again, and the mask has the trimmed grid's size.
             var mask = current.mask
-            if let grown = edit.grownTransform, let owned = current.mask, owned.placement == nil,
+            if let placed = made.transform, let owned = current.mask, owned.placement == nil,
                owned.asset.image.width > 1 || owned.asset.image.height > 1 {
                 var enabled = owned
                 enabled.isEnabled = true
-                guard let carried = enabled.clipImage(placement: current.transform, over: grown,
+                guard let carried = enabled.clipImage(placement: current.transform, over: placed,
                                                       width: asset.image.width, height: asset.image.height) else { throw ExportError.render }
                 mask = owned.replacing(try LayerMask.asset(from: carried))
             }
             beginEdit(edit.kind.rawValue)
-            document?.layers[index] = ImageLayer(id: current.id, asset: asset, name: current.name, isVisible: current.isVisible,
-                transform: made.transform ?? current.transform, parentID: current.parentID, isGroup: false,
-                opacity: current.opacity, blendMode: current.blendMode, mask: mask, maskSourceID: current.maskSourceID)
+            document?.layers[index] = current.replacingPixels(asset, transform: made.transform, mask: mask)
             endEdit()
         } catch { brushError = error.localizedDescription }
     }
@@ -564,7 +655,7 @@ extension EditorSession {
             }.value
             guard let index = document?.layers.firstIndex(where: { $0.id == edit.layerID }),
                   let layer = document?.layers[index], layer.asset?.image === edit.original.image,
-                  layer.transform == edit.transform else { return }
+                  layer.transform == edit.transform else { reportDroppedApply(edit.kind.rawValue); return }
             let asset = try LayerMask.asset(from: made)
             beginEdit(edit.kind.rawValue)
             document?.layers[index].mask = layer.mask.map { $0.replacing(asset) } ?? LayerMask(asset: asset)
@@ -572,5 +663,16 @@ extension EditorSession {
             isMaskSelected = true
             endEdit()
         } catch { brushError = error.localizedDescription }
+    }
+}
+
+let adjustmentLog = Logger.compositor("Adjustments")
+
+extension EditorSession {
+    /// OK finished after its layer changed underneath it (deleted, or its pixels or placement replaced), so the result
+    /// would land on the wrong pixels. Dropping it is right; dropping it without a word left the user thinking it applied.
+    func reportDroppedApply(_ name: String) {
+        adjustmentLog.notice("\(name, privacy: .public) finished after its layer changed; the result was discarded")
+        brushError = "\(name) wasn’t applied: the layer changed while it was being made."
     }
 }

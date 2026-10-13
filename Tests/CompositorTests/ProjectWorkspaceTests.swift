@@ -55,6 +55,32 @@ import Testing
         #expect(workspace.tabs.count == 1 && workspace.current.session.document == nil)
     }
 
+    /// An open effects panel doesn't hold a tab switch up; it closes with its edits kept, rather than staying on screen
+    /// bound to a tab that's out of view.
+    @Test func switchingTabsClosesTheEffectsPanelAndKeepsItsEdits() throws {
+        let workspace = ProjectWorkspace()
+        let first = workspace.current
+        first.session.createDocument(width: 20, height: 20)
+        first.session.insert(try LiveMaskTests().asset([255, 255, 255, 255]))
+        let layer = try #require(first.session.activeLayerID)
+        first.session.addEffect(.stroke)
+        #expect(first.session.effectsEditing == LayerEffectSelection(layerID: layer, kind: .stroke))
+        #expect(workspace.canSwitch)
+
+        workspace.newCanvas()
+        #expect(workspace.current !== first)
+        #expect(first.session.effectsEditing == nil)
+        #expect(first.session.document?.layers.first?.effects?.stroke != nil)
+
+        // The same going back and forth with select.
+        workspace.select(first.id)
+        first.session.selectEffect(.stroke, on: layer, editing: true)
+        #expect(first.session.effectsEditing != nil)
+        workspace.select(workspace.tabs[1].id)
+        #expect(first.session.effectsEditing == nil)
+        #expect(first.session.document?.layers.first?.effects?.stroke != nil)
+    }
+
     @Test func crossProjectCopyRemapsIdentityAndHasIndependentUndo() async throws {
         let workspace = ProjectWorkspace()
         let first = workspace.current

@@ -150,4 +150,46 @@ struct GradientTests {
         #expect(session.gradientColors(mask: false).first.flatMap { $0.components?.first } == 1)
         session.cancelGradient()
     }
+
+    /// While the line is dragged only what the canvas shows is redone — a reduced picture when the layer is shown
+    /// small, the visible tiles when zoomed in — and the drag's end paints the rest, so what is committed is exactly
+    /// what painting every tile on every move would have made.
+    @Test func draggingRedoesOnlyWhatTheCanvasShowsAndCommitsTheSamePixels() async throws {
+        func gradient(zoom: CGFloat?) async throws -> (pixels: Data, previewed: Bool, pending: Bool) {
+            let session = makeSession(width: 1200, height: 900)
+            session.gradientSettings.shape = .radial
+            if let zoom {
+                session.viewport.resize(to: CGSize(width: 400, height: 300), backingScale: 1, documentSize: CGSize(width: 1200, height: 900))
+                if zoom > 0 { session.viewport.setZoom(zoom, anchoredAt: CGPoint(x: 200, y: 150), documentSize: CGSize(width: 1200, height: 900)) }
+            }
+            session.beginGradient(at: CGPoint(x: 600.5, y: 450.5))
+            var previewed = false, pending = false
+            for end in [CGPoint(x: 900, y: 450), CGPoint(x: 700, y: 800), CGPoint(x: 1100.5, y: 120.5)] {
+                session.moveGradient(end: end)
+                let raster = try #require(session.gradientEdit?.raster)
+                previewed = previewed || raster.gradientPreview != nil
+                pending = pending || raster.hasPendingGradient
+            }
+            session.endGradientDrag()
+            let raster = try #require(session.gradientEdit?.raster)
+            #expect(raster.gradientPreview == nil && !raster.hasPendingGradient, "the drag's end paints every tile")
+            await session.commitGradient()
+            #expect(session.brushError == nil)
+            let image = try await render(session)
+            let context = try BrushRaster.context(width: image.width, height: image.height, mask: false)
+            BrushRaster.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height), mask: false, context: context)
+            return (Data(bytes: try #require(context.data), count: context.bytesPerRow * context.height), previewed, pending)
+        }
+        // No canvas yet: every tile on every move, as before.
+        let everyTile = try await gradient(zoom: nil)
+        #expect(!everyTile.previewed && !everyTile.pending)
+        // Fitted in a small view, the layer is shown at a third of its size: a reduced picture during the drag.
+        let small = try await gradient(zoom: 0)
+        #expect(small.previewed && small.pending)
+        #expect(small.pixels == everyTile.pixels)
+        // Zoomed in, only the visible tiles move with the line.
+        let zoomed = try await gradient(zoom: 2)
+        #expect(!zoomed.previewed && zoomed.pending)
+        #expect(zoomed.pixels == everyTile.pixels)
+    }
 }

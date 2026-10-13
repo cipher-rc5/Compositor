@@ -53,6 +53,43 @@ nonisolated enum PixelAdjust {
         return result
     }
 
+    /// `work` off the main actor, cancelled along with the task awaiting it. A plain `Task.detached` ran on after
+    /// its preview was superseded or its panel closed; this one stops at the work's next `Task.checkCancellation()`.
+    static func detached<T: Sendable>(_ work: @escaping @Sendable () throws -> T) async throws -> T {
+        let task = Task.detached(priority: .userInitiated, operation: work)
+        return try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+    }
+
+    /// A copy of a layer for an adjustment panel's previews, and the mapping placing its own pixel grid.
+    struct PreviewCopy: Sendable {
+        let image: CGImage
+        /// Pixels in the copy per pixel of the layer.
+        let scale: CGFloat
+        let mapping: CGAffineTransform
+    }
+
+    /// `image` drawn no larger than `limit` pixels on its longest side, nearest-neighbor, for previews that would be
+    /// slow at full size; nil when it already fits. With a `raster`, that is drawn instead of the flattened image.
+    /// It reads the whole layer, so callers run it off the main actor.
+    static func previewCopy(of image: CGImage, raster: RasterSnapshot? = nil, limit: CGFloat,
+                            placed: LayerTransform) throws -> PreviewCopy? {
+        let factor = min(1, limit / CGFloat(max(image.width, image.height)))
+        guard factor < 1 else { return nil }
+        let width = max(1, Int(CGFloat(image.width) * factor)), height = max(1, Int(CGFloat(image.height) * factor))
+        let context = try BrushRaster.context(width: width, height: height, mask: false)
+        let rect = CGRect(x: 0, y: 0, width: width, height: height)
+        if let raster { raster.draw(in: rect, context: context) }
+        else { BrushRaster.draw(image, in: rect, mask: false, context: context) }
+        guard let small = context.makeImage() else { throw ExportError.render }
+        return PreviewCopy(image: small, scale: CGFloat(width) / CGFloat(image.width),
+                           mapping: BrushRaster.pixelToDocument(placed, width: width, height: height))
+    }
+
+    /// Whether `previewCopy` would make a copy, without making it.
+    static func needsPreviewCopy(_ image: CGImage, limit: CGFloat) -> Bool {
+        CGFloat(max(image.width, image.height)) > limit
+    }
+
     /// A small preview for the Layers panel, matching imported thumbnails.
     static func thumbnail(of image: CGImage) throws -> CGImage {
         let factor = min(1, 96 / CGFloat(max(image.width, image.height)))

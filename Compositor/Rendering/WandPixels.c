@@ -172,3 +172,49 @@ fail:
     free(lens);
     return -1;
 }
+
+long wand_threshold(const uint8_t *bytes, size_t width, size_t height, size_t stride, size_t step,
+                    uint8_t threshold, int below, uint8_t *mask) {
+    long count = 0;
+    for (size_t y = 0; y < height; ++y) {
+        const uint8_t *row = bytes + y * stride;
+        uint8_t *out = mask + y * width;
+        for (size_t x = 0; x < width; ++x) {
+            int marked = below ? row[x * step] < threshold : row[x * step] >= threshold;
+            out[x] = marked ? 255 : 0;
+            count += marked;
+        }
+    }
+    return count;
+}
+
+int wand_morph(uint8_t *mask, size_t width, size_t height, int steps, int erode) {
+    if (!width || !height || steps <= 0) return 0;
+    if (width > SIZE_MAX / height) return -1;
+    size_t count = width * height;
+    uint8_t *other = malloc(count);
+    if (!other) return -1;
+    // Each step reads the last one whole and writes the other buffer, as the Swift it replaced copied its mask.
+    uint8_t *from = mask, *into = other;
+    for (int step = 0; step < steps; ++step) {
+        memcpy(into, from, count);
+        for (size_t y = 0; y < height; ++y) {
+            size_t y0 = y > 0 ? y - 1 : 0, y1 = y + 1 < height ? y + 1 : height - 1;
+            for (size_t x = 0; x < width; ++x) {
+                int set = from[y * width + x] != 0;
+                if (set != (erode != 0)) continue;
+                size_t x0 = x > 0 ? x - 1 : 0, x1 = x + 1 < width ? x + 1 : width - 1;
+                int found = 0;
+                for (size_t ny = y0; ny <= y1 && !found; ++ny)
+                    for (size_t nx = x0; nx <= x1; ++nx)
+                        if ((from[ny * width + nx] != 0) != (erode != 0)) { found = 1; break; }
+                if (erode) into[y * width + x] = found ? 0 : 255;
+                else if (found) into[y * width + x] = 255;
+            }
+        }
+        uint8_t *swap = from; from = into; into = swap;
+    }
+    if (from != mask) memcpy(mask, from, count);
+    free(other);
+    return 0;
+}

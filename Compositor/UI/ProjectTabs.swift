@@ -1,7 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
 import AppKit
-import Combine
 
 struct ProjectWorkspaceView: View {
     let applicationDelegate: CompositorApplicationDelegate
@@ -20,11 +19,10 @@ struct ProjectWorkspaceView: View {
 
 struct ProjectTabStrip: View {
     let workspace: ProjectWorkspace
-    @State private var dragging = false
     /// Scrolled away from the first tab, so the left edge fades too.
     @State private var scrolledFromStart = false
-    @State private var dragChangeCount = NSPasteboard(name: .drag).changeCount
-    private let dragTimer = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
+    @State private var stripTargeted = false
+    private var dragging: Bool { workspace.isDragging }
     var body: some View {
         ScrollViewReader { reader in
         ScrollView(.horizontal) {
@@ -38,6 +36,10 @@ struct ProjectTabStrip: View {
             }.frame(height: 34, alignment: .center)
         }
         .frame(height: 34, alignment: .center)
+        // The strip's empty stretch takes drops as a new tab too. Mostly, though, it's how the strip learns a drag has
+        // arrived, so the New slot can appear.
+        .onDrop(of: [UTType.fileURL.identifier, UTType.image.identifier, ProjectWorkspace.layerType], delegate:
+            ProjectTabDropDelegate(workspace: workspace, destination: nil, targeted: $stripTargeted))
         .scrollIndicators(.hidden)
         .onScrollGeometryChange(for: Bool.self) { $0.contentOffset.x > 1 } action: { _, scrolled in
             scrolledFromStart = scrolled
@@ -59,17 +61,6 @@ struct ProjectTabStrip: View {
         .onChange(of: dragging) { _, active in
             if active { reader.scrollTo("new-tab-drop", anchor: .trailing) }
             else { reader.scrollTo(workspace.selectedID) }
-        }
-        .onReceive(dragTimer) { _ in
-            // External drags don't deliver mouse-down to our window. Track the
-            // drag pasteboard's new session, and clear on release/cancel.
-            let pasteboard = NSPasteboard(name: .drag)
-            if NSEvent.pressedMouseButtons == 0 {
-                dragging = false
-                dragChangeCount = pasteboard.changeCount
-            } else if pasteboard.changeCount != dragChangeCount {
-                dragging = pasteboard.availableType(from: [.fileURL, .png, .tiff, NSPasteboard.PasteboardType(ProjectWorkspace.layerType)]) != nil
-            }
         }
         }
     }
@@ -165,7 +156,10 @@ private struct ProjectTabDropDelegate: DropDelegate {
         return workspace?.canSwitch == true && workspace?.canReceiveDrag(into: destination) == true
             && info.hasItemsConforming(to: [ProjectWorkspace.layerType, UTType.fileURL.identifier, UTType.image.identifier])
     }
-    func dropEntered(info: DropInfo) { targeted = validateDrop(info: info) }
+    func dropEntered(info: DropInfo) {
+        targeted = validateDrop(info: info)
+        if targeted { workspace?.dragDidEnter() }
+    }
     func dropExited(info: DropInfo) { targeted = false }
     func dropUpdated(info: DropInfo) -> DropProposal? {
         DropProposal(operation: validateDrop(info: info) ? .copy : .forbidden)

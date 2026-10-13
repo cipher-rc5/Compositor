@@ -12,7 +12,7 @@ import Foundation
 /// Graphics's last resample can reach, so a piece's pixels match the whole image's; the unchanged image fills
 /// the rest. Clips are hard-edged so the parts meet without gaps or overlap.
 nonisolated enum TiledLayerRenderer {
-    nonisolated struct Piece: @unchecked Sendable {
+    nonisolated struct Piece: Sendable {
         /// Grid pixels this piece draws.
         let interior: CGRect
         /// Grid pixels its image holds: the interior and a margin.
@@ -221,7 +221,10 @@ nonisolated enum TiledLayerRenderer {
 
     /// A committed raster placed at `offset` in the frame's grid, leaving `holes` for pieces drawn over it.
     private static func drawCommitted(_ raster: RasterSnapshot, at offset: CGPoint, holes: [CGRect], frame: Frame, in context: CGContext) {
-        let pieces = TiledPieceCache.shared.pieces(for: raster, level: frame.level).map { $0.offsetBy(offset) }
+        guard let pieces = TiledPieceCache.shared.pieces(for: raster, level: frame.level)?.map({ $0.offsetBy(offset) }) else {
+            drawUnbuilt(raster, at: offset, holes: holes, frame: frame, in: context)
+            return
+        }
         if let base = raster.base {
             drawBase(base, at: raster.baseRect.offsetBy(dx: offset.x, dy: offset.y), holes: pieces.map(\.interior) + holes,
                      frame: frame, in: context)
@@ -229,6 +232,24 @@ nonisolated enum TiledLayerRenderer {
         let visible = frame.visible.insetBy(dx: -2, dy: -2)
         for piece in pieces where piece.interior.intersects(visible) {
             draw(piece, holes: holes, frame: frame, in: context)
+        }
+    }
+
+    /// A committed raster whose pieces are still being built (see `CacheMissDeferral`): its base, and each of its
+    /// tiles drawn on its own. Seams can show where tiles meet until the pieces land; nothing waits on them.
+    private static func drawUnbuilt(_ raster: RasterSnapshot, at offset: CGPoint, holes: [CGRect], frame: Frame, in context: CGContext) {
+        let patches = raster.patches.map { BrushPatch(rect: $0.rect.offsetBy(dx: offset.x, dy: offset.y), image: $0.image) }
+        if let base = raster.base {
+            drawBase(base, at: raster.baseRect.offsetBy(dx: offset.x, dy: offset.y), holes: patches.map(\.rect) + holes,
+                     frame: frame, in: context)
+        }
+        let visible = frame.visible.insetBy(dx: -2, dy: -2)
+        for patch in patches where patch.rect.intersects(visible) {
+            context.saveGState()
+            clip(to: patch.rect, excluding: holes, frame: frame, in: context)
+            context.setShouldAntialias(frame.sampling != .nearest)
+            context.draw(patch.image, in: frame.mapped(patch.rect))
+            context.restoreGState()
         }
     }
 
@@ -369,10 +390,15 @@ nonisolated enum TiledLayerRenderer {
 }
 
 /// Committed rasters' pieces, built once per snapshot and level (snapshots never change); the least recently
-/// used are dropped beyond a pixel budget.
+/// used are dropped beyond a pixel budget. Unchecked because `entries`, `clock` and `building` are mutable: they are
+/// only read or written with `lock` held, which is never held while pieces are built.
 nonisolated final class TiledPieceCache: @unchecked Sendable {
     static let shared = TiledPieceCache()
-    static let pixelBudget = 150_000_000
+    /// Pixels kept at once, counting each entry's snapshot (its base and tiles, which the entry keeps alive) as well
+    /// as its pieces: room for a 100 MP painted layer with its pieces.
+    static let defaultPixelBudget = 250_000_000
+    let pixelBudget: Int
+    init(pixelBudget: Int = TiledPieceCache.defaultPixelBudget) { self.pixelBudget = pixelBudget }
     private struct Key: Hashable {
         let raster: ObjectIdentifier
         let level: Int
@@ -385,9 +411,12 @@ nonisolated final class TiledPieceCache: @unchecked Sendable {
     }
     private var entries: [Key: Entry] = [:]
     private var clock: UInt64 = 0
+    /// Pieces being made on the builder, so a miss drawn again doesn't queue them twice.
+    private var building: Set<Key> = []
     private let lock = NSLock()
 
-    func pieces(for raster: RasterSnapshot, level: Int) -> [TiledLayerRenderer.Piece] {
+    /// The raster's pieces at `level`, built now — or, under a `CacheMissDeferral`, nil until the builder has them.
+    func pieces(for raster: RasterSnapshot, level: Int) -> [TiledLayerRenderer.Piece]? {
         let key = Key(raster: ObjectIdentifier(raster), level: level)
         lock.lock()
         clock += 1
@@ -396,7 +425,27 @@ nonisolated final class TiledPieceCache: @unchecked Sendable {
             lock.unlock()
             return entry.pieces
         }
+        guard let deferral = CacheMissDeferral.current else {
+            lock.unlock()
+            return build(raster, level: level)
+        }
+        let fresh = building.insert(key).inserted
         lock.unlock()
+        if fresh {
+            // The snapshot is held until the build ends, so its identifier can't be reused for another meanwhile.
+            CacheMissDeferral.builder.async { [self] in
+                _ = build(raster, level: level)
+                lock.lock()
+                building.remove(key)
+                lock.unlock()
+                deferral.finished(key)
+            }
+        }
+        return nil
+    }
+
+    private func build(_ raster: RasterSnapshot, level: Int) -> [TiledLayerRenderer.Piece] {
+        let key = Key(raster: ObjectIdentifier(raster), level: level)
         let origin = raster.alignment
         let full = CGRect(x: 0, y: 0, width: raster.width, height: raster.height)
         let squares = TiledLayerRenderer.interiors(near: raster.patches.map(\.rect), margin: TiledLayerRenderer.support(level: level),
@@ -404,16 +453,33 @@ nonisolated final class TiledPieceCache: @unchecked Sendable {
         let pieces = squares.compactMap { square in
             TiledLayerRenderer.piece(interior: square, level: level, origin: origin, bounds: full) { context, _ in raster.draw(in: full, context: context) }
         }
-        let pixels = pieces.reduce(0) { $0 + $1.image.width * $1.image.height }
+        let held = (raster.base.map { $0.width * $0.height } ?? 0)
+            + raster.patches.reduce(0) { $0 + $1.image.width * $1.image.height }
+        let pixels = pieces.reduce(held) { $0 + $1.image.width * $1.image.height }
         lock.lock()
         entries[key] = Entry(raster: raster, pieces: pieces, lastUse: clock, pixels: pixels)
         var total = entries.values.reduce(0) { $0 + $1.pixels }
-        while total > Self.pixelBudget,
-              let oldest = entries.filter({ $0.key != key }).min(by: { $0.value.lastUse < $1.value.lastUse }) {
+        // The entry just made goes last, and only when it alone is over the budget (see DownsampleCache.evict).
+        while total > pixelBudget,
+              let oldest = entries.filter({ $0.key != key }).min(by: { $0.value.lastUse < $1.value.lastUse })
+                ?? entries.first(where: { $0.key == key }) {
             total -= oldest.value.pixels
             entries.removeValue(forKey: oldest.key)
         }
         lock.unlock()
         return pieces
+    }
+
+    /// What the kept entries hold, as the budget counts it.
+    var retainedPixels: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries.values.reduce(0) { $0 + $1.pixels }
+    }
+    /// Whether pieces of `raster` at `level` are kept.
+    func holds(_ raster: RasterSnapshot, level: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries[Key(raster: ObjectIdentifier(raster), level: level)]?.raster === raster
     }
 }

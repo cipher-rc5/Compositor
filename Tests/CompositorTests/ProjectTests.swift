@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 import UniformTypeIdentifiers
 import Testing
 @testable import Compositor
@@ -116,19 +117,19 @@ struct ProjectTests {
         let original = try Data(contentsOf: url.appendingPathComponent("manifest.json"))
         var invalid = snapshot.manifest
         invalid.version = 99
-        do {
+        await #expect(throws: ProjectError.version(99)) {
             try await ProjectStore.shared.save(ProjectSnapshot(manifest: invalid, images: [:]), to: url)
-            Issue.record("Unsupported version was saved")
-        } catch {}
+        }
         #expect(try Data(contentsOf: url.appendingPathComponent("manifest.json")) == original)
         let loaded = try await ProjectStore.shared.load(from: url)
         #expect(loaded.manifest.layers.count == 1)
         let blocker = root.appendingPathComponent("not-a-directory")
         try Data([1]).write(to: blocker)
-        do {
+        // Foundation's own error, which names the folder that couldn't be written.
+        let failure = await #expect(throws: CocoaError.self) {
             try await ProjectStore.shared.save(snapshot, to: blocker.appendingPathComponent("CannotSave.comp"))
-            Issue.record("Writing through a regular file unexpectedly succeeded")
-        } catch {}
+        }
+        #expect(failure?.isFileError == true)
         #expect(try Data(contentsOf: url.appendingPathComponent("manifest.json")) == original)
     }
 
@@ -149,16 +150,18 @@ struct ProjectTests {
             _ = try await ProjectStore.shared.load(from: url)
             Issue.record("Future version opened")
         } catch ProjectError.version(let version) { #expect(version == 42) }
+        // A filename that isn't the layer's own is refused before any file is looked at; paths that reach
+        // outside the package through links are covered by linkedAssetsAreRefusedWhereverTheyPoint.
         let record = try #require(snapshot.manifest.layers.first)
         var unsafe = snapshot.manifest
         unsafe.layers = [ProjectLayerRecord(id: record.id, name: record.name, isVisible: true,
             transform: record.transform, imageFile: "../../outside.png")]
         try JSONEncoder().encode(unsafe).write(to: metadata)
-        do { _ = try await ProjectStore.shared.load(from: url); Issue.record("Path traversal accepted") }
-        catch {}
+        await #expect(throws: ProjectError.invalid) { try await ProjectStore.shared.load(from: url) }
         try Data("not json".utf8).write(to: metadata)
-        do { _ = try await ProjectStore.shared.load(from: url); Issue.record("Corrupt metadata accepted") }
-        catch {}
+        await #expect(throws: ProjectError.invalid) { try await ProjectStore.shared.load(from: url) }
+        try FileManager.default.removeItem(at: metadata)
+        await #expect(throws: ProjectError.invalid) { try await ProjectStore.shared.load(from: url) }
         #expect(session.document?.layers.count == 1)
     }
 
@@ -173,9 +176,157 @@ struct ProjectTests {
         let url = root.appendingPathComponent("Missing.comp")
         try await ProjectStore.shared.save(snapshot, to: url)
         let filename = try #require(snapshot.manifest.layers.first?.imageFile)
-        try FileManager.default.removeItem(at: url.appendingPathComponent("images").appendingPathComponent(filename))
-        do { _ = try await ProjectStore.shared.load(from: url); Issue.record("Missing image accepted") }
-        catch {}
+        let asset = url.appendingPathComponent("images").appendingPathComponent(filename)
+        try FileManager.default.removeItem(at: asset)
+        await #expect(throws: ProjectError.missingImage) { try await ProjectStore.shared.load(from: url) }
+        // A folder (or any other non-file) where the image should be is just as missing.
+        try FileManager.default.createDirectory(at: asset, withIntermediateDirectories: false)
+        await #expect(throws: ProjectError.missingImage) { try await ProjectStore.shared.load(from: url) }
+    }
+
+    // MARK: Hostile packages
+
+    /// A saved one-image project, and where its manifest and image are, for tests that then damage it.
+    private func savedImageProject(in root: URL) async throws -> (url: URL, manifest: ProjectManifest, image: URL) {
+        let source = try ImageImportTests().fixture(.png)
+        defer { try? FileManager.default.removeItem(at: source) }
+        let session = EditorSession()
+        await session.importImages([source])
+        let snapshot = try #require(session.projectSnapshot())
+        let url = root.appendingPathComponent("Hostile.comp")
+        try await ProjectStore.shared.save(snapshot, to: url)
+        let filename = try #require(snapshot.manifest.layers.first?.imageFile)
+        return (url, snapshot.manifest, url.appendingPathComponent("images").appendingPathComponent(filename))
+    }
+
+    private func write(_ manifest: ProjectManifest, into url: URL) throws {
+        try JSONEncoder().encode(manifest).write(to: url.appendingPathComponent("manifest.json"))
+    }
+
+    @Test func oversizedCanvasAndTooManyLayersAreTooLarge() async throws {
+        let root = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let project = try await savedImageProject(in: root)
+        for (width, height) in [(30_001, 10), (10, 30_001), (0, 10)] {
+            let manifest = ProjectManifest(documentID: UUID(), width: width, height: height, activeLayerID: nil,
+                                           layers: project.manifest.layers)
+            try write(manifest, into: project.url)
+            await #expect(throws: ProjectError.tooLarge, "\(width) × \(height)") { try await ProjectStore.shared.load(from: project.url) }
+        }
+        // Blank layers carry no image, so only the count is over.
+        let blank = (0...10_000).map { index in
+            ProjectLayerRecord(id: UUID(), name: "Layer \(index)", isVisible: true,
+                               transform: LayerTransform(origin: .zero, size: CGSize(width: 10, height: 10)), imageFile: nil)
+        }
+        var crowded = ProjectManifest(documentID: UUID(), width: 100, height: 100, activeLayerID: nil, layers: blank)
+        try write(crowded, into: project.url)
+        await #expect(throws: ProjectError.tooLarge) { try await ProjectStore.shared.load(from: project.url) }
+        crowded.layers.removeLast()
+        try write(crowded, into: project.url)
+        #expect(try await ProjectStore.shared.load(from: project.url).manifest.layers.count == 10_000)
+    }
+
+    /// Two 60-megapixel images: each is within the per-image limits, but together they pass the 100-megapixel
+    /// budget, and the second is refused from its header before it is decoded.
+    @Test func imagesPastTheHundredMegapixelBudgetAreTooLarge() async throws {
+        let root = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let project = try await savedImageProject(in: root)
+        let context = try #require(CGContext(data: nil, width: 10_000, height: 6_000, bitsPerComponent: 8, bytesPerRow: 10_000,
+                                             space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue))
+        let large = try #require(context.makeImage())
+        let first = try #require(project.manifest.layers.first)
+        let id = UUID()
+        var manifest = project.manifest
+        manifest.layers.append(ProjectLayerRecord(id: id, name: "Second", isVisible: true, transform: first.transform,
+                                                  imageFile: "\(id.uuidString).png"))
+        let images = project.image.deletingLastPathComponent()
+        for record in manifest.layers {
+            let file = images.appendingPathComponent(try #require(record.imageFile))
+            try? FileManager.default.removeItem(at: file)
+            let destination = try #require(CGImageDestinationCreateWithURL(file as CFURL, UTType.png.identifier as CFString, 1, nil))
+            CGImageDestinationAddImage(destination, large, nil)
+            #expect(CGImageDestinationFinalize(destination))
+        }
+        try write(manifest, into: project.url)
+        await #expect(throws: ProjectError.tooLarge) { try await ProjectStore.shared.load(from: project.url) }
+        manifest.layers.removeLast()
+        try write(manifest, into: project.url)
+        #expect(try await ProjectStore.shared.load(from: project.url).images.count == 1)
+    }
+
+    /// Sizes are read from the file system before anything is read, so sparse files stand in for huge ones.
+    @Test func oversizedAssetAndManifestAreTooLarge() async throws {
+        let root = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let project = try await savedImageProject(in: root)
+        let handle = try FileHandle(forWritingTo: project.image)
+        try handle.truncate(atOffset: 512 * 1024 * 1024 + 1)
+        try handle.close()
+        await #expect(throws: ProjectError.tooLarge) { try await ProjectStore.shared.load(from: project.url) }
+        let manifest = try FileHandle(forWritingTo: project.url.appendingPathComponent("manifest.json"))
+        try manifest.truncate(atOffset: 4 * 1024 * 1024 + 1)
+        try manifest.close()
+        await #expect(throws: ProjectError.tooLarge) { try await ProjectStore.shared.load(from: project.url) }
+    }
+
+    /// A link is refused wherever it points: outside the package (the image folder swapped for a link to
+    /// another folder holding a same-named file — a real path traversal), or to another file inside it.
+    @Test func linkedAssetsAreRefusedWhereverTheyPoint() async throws {
+        let root = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let project = try await savedImageProject(in: root)
+        let images = project.image.deletingLastPathComponent()
+        let outside = root.appendingPathComponent("outside")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: false)
+        try FileManager.default.copyItem(at: project.image, to: outside.appendingPathComponent(project.image.lastPathComponent))
+        let kept = root.appendingPathComponent("kept-images")
+        try FileManager.default.moveItem(at: images, to: kept)
+        try FileManager.default.createSymbolicLink(at: images, withDestinationURL: outside)
+        await #expect(throws: ProjectError.unsafeFile) { try await ProjectStore.shared.load(from: project.url) }
+
+        try FileManager.default.removeItem(at: images)
+        try FileManager.default.moveItem(at: kept, to: images)
+        #expect(try await ProjectStore.shared.load(from: project.url).images.count == 1)
+        let inside = images.appendingPathComponent("elsewhere.png")
+        try FileManager.default.moveItem(at: project.image, to: inside)
+        try FileManager.default.createSymbolicLink(at: project.image, withDestinationURL: inside)
+        await #expect(throws: ProjectError.unsafeFile) { try await ProjectStore.shared.load(from: project.url) }
+        try FileManager.default.removeItem(at: project.image)
+        try FileManager.default.createSymbolicLink(at: project.image, withDestinationURL: outside.appendingPathComponent(project.image.lastPathComponent))
+        await #expect(throws: ProjectError.unsafeFile) { try await ProjectStore.shared.load(from: project.url) }
+    }
+
+    /// Effects and shapes are only drawn at render time, so a damaged one has to be caught on open rather
+    /// than opening fine and failing the first export.
+    @Test func damagedEffectsAndShapesAreRejectedOnOpen() async throws {
+        let root = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let project = try await savedImageProject(in: root)
+        var manifest = project.manifest
+        manifest.layers[0].effects = LayerEffects(stroke: StrokeEffect(size: 4))
+        try write(manifest, into: project.url)
+        #expect(try await ProjectStore.shared.load(from: project.url).manifest.layers[0].effects?.stroke?.size == 4)
+        for effects in [LayerEffects(stroke: StrokeEffect(size: 9_999)), LayerEffects(shadow: ShadowEffect(opacity: 2)),
+                        LayerEffects(outerGlow: OuterGlowEffect(red: -1))] {
+            manifest.layers[0].effects = effects
+            try write(manifest, into: project.url)
+            await #expect(throws: ProjectError.invalid) { try await ProjectStore.shared.load(from: project.url) }
+        }
+        manifest.layers[0].effects = nil
+        let shape = LayerShapeStyle(kind: .rectangle, red: 1, green: 0, blue: 0, cornerRadius: 4)
+        manifest.layers[0].shape = shape
+        try write(manifest, into: project.url)
+        #expect(try await ProjectStore.shared.load(from: project.url).manifest.layers[0].shape == shape)
+        var damaged = [shape, shape, shape]
+        damaged[0].cornerRadius = -3
+        damaged[1].green = 4
+        damaged[2].start = CGPoint(x: 0.5, y: 7)
+        for style in damaged {
+            manifest.layers[0].shape = style
+            try write(manifest, into: project.url)
+            await #expect(throws: ProjectError.invalid) { try await ProjectStore.shared.load(from: project.url) }
+        }
     }
 
     @Test func projectOperationsBlockEditsAndQueueImageImports() async throws {

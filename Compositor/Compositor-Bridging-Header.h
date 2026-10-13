@@ -2,6 +2,7 @@
 #import "Rendering/HealPixels.h"
 #import "Rendering/LevelsPixels.h"
 #import "Rendering/WandPixels.h"
+#import "Rendering/MattePixels.h"
 #import "Rendering/NoisePixels.h"
 #import "Rendering/LensPixels.h"
 #import "Rendering/ContentFill.h"

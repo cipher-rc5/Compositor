@@ -53,6 +53,22 @@ struct CurvesControls: View {
                     settings.channels[settings.channel.index] = p
                 }.onEnded { _ in dragging = nil })
             } }
+            // To VoiceOver the graph is one control: it steps through the points, and increment and decrement
+            // raise and lower the selected one's output.
+            .accessibilityElement()
+            .accessibilityLabel("\(settings.channel.rawValue) curve")
+            .accessibilityValue(accessibilityValue)
+            .accessibilityAdjustableAction { direction in
+                switch direction {
+                case .increment: nudgeSelectedPoint(by: 5)
+                case .decrement: nudgeSelectedPoint(by: -5)
+                @unknown default: break
+                }
+            }
+            .accessibilityAction(named: "Next point") { selected = ((selected ?? -1) + 1) % max(1, points.count) }
+            .accessibilityAction(named: "Previous point") {
+                selected = ((selected ?? points.count) - 1 + points.count) % max(1, points.count)
+            }
             Text("Click to add a point. Drag to adjust.").font(.caption).foregroundStyle(.secondary)
             HStack {
                 if let selected, points.indices.contains(selected) {
@@ -65,5 +81,21 @@ struct CurvesControls: View {
             }
             Button("Reset curve") { settings.channels[settings.channel.index] = [CurvePoint(x: 0,y: 0), CurvePoint(x: 255,y: 255)]; selected = nil }
         }
+    }
+
+    private var accessibilityValue: String {
+        let count = "\(points.count) points"
+        guard let selected, points.indices.contains(selected) else { return count }
+        return "\(count). Point \(selected + 1): input \(Int(points[selected].x)), output \(Int(points[selected].y))"
+    }
+
+    /// Raises or lowers the selected point's output (the first point, when none is selected yet).
+    private func nudgeSelectedPoint(by amount: Double) {
+        let index = selected ?? 0
+        var p = points
+        guard p.indices.contains(index) else { return }
+        p[index].y = min(255, max(0, p[index].y + amount))
+        settings.channels[settings.channel.index] = p
+        selected = index
     }
 }

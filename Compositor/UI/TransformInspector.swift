@@ -23,6 +23,7 @@ struct TransformInspector: View {
                 TransformValueField(label: "H", value: value.size.height) { resize($0, width: false) }.frame(width: 85)
                 Toggle(isOn: $session.locksTransformRatio) { Image(systemName: "link") }
                     .toggleStyle(.button).help("Lock aspect ratio")
+                    .accessibilityLabel("Lock aspect ratio")
                 TransformValueField(label: "Scale", suffix: "%", value: value.scalePercent(pixelSize: pixelSize)) { number in
                     change { value in
                         guard number > 0 else { return }
@@ -44,7 +45,7 @@ struct TransformInspector: View {
           }.scrollIndicators(.hidden)
           Button("Cancel") { session.cancelTransform() }.configuredNativeShortcut(.escape)
               .disabled(session.transformEdit == nil)
-          Button("Apply") { session.commitTransform() }.configuredNativeShortcut(.return)
+          Button("Apply") { Task { await session.applyTransform() } }.configuredNativeShortcut(.return)
               .disabled(session.transformEdit == nil).accessibilityIdentifier("applyTransform")
         }.padding(.trailing, 18).toolHeaderBar().releasesFocusOnCommit(session)
     }

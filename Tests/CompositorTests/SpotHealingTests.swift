@@ -58,4 +58,25 @@ struct SpotHealingTests {
             #expect(after(x, y) == before(x, y), "\(mode): (\(x), \(y)) changed outside the brush")
         }
     }
+
+    /// Mouse-up hands the heal to a background task: edits wait until it has committed, and the stroke stays on the
+    /// canvas meanwhile.
+    @Test func mouseUpHealsInTheBackgroundWhileEditsWait() async throws {
+        let session = EditorSession()
+        session.createDocument(width: 120, height: 80)
+        let original = try blemished()
+        session.insert(ImportedImage(image: original, thumbnail: original, name: "Surface"))
+        session.selectTool(.spotHealing)
+        session.brushSettings = BrushSettings(diameter: 24, hardness: 1, red: 0, green: 0, blue: 0)
+        let count = session.history.undoCount
+        session.beginBrush(at: CGPoint(x: 60, y: 40))
+        #expect(session.finishBrushImmediately())
+        #expect(session.isProjectBusy && session.brushStroke != nil && !session.canEditLayers)
+        #expect(!session.finishBrushImmediately()) // A second mouse-up waits its turn.
+        await session.waitForProjectAccess()
+        #expect(session.brushStroke == nil && session.brushError == nil && session.history.undoCount == count + 1)
+        #expect(session.history.undoName == "Spot Healing")
+        let healed = try pixels(try await ImageExporter.shared.render(try #require(session.projectSnapshot())).image)(60, 40)
+        #expect(healed[0] - healed[1] < 30, "\(healed) is still red")
+    }
 }

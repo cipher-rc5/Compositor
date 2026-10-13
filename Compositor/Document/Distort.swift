@@ -236,6 +236,59 @@ nonisolated enum DistortWarp {
         }
         return result
     }
+
+    /// `layer`, shown by `transform`, with its pixels resampled so its corners land on `corners` and cropped to
+    /// what is visible (`warpTrimmed`), and its mask carried along. Nil for a layer without pixels.
+    static func distort(_ layer: ImageLayer, transform: LayerTransform, corners: [CGPoint]) throws -> DistortedLayer? {
+        guard let image = layer.asset?.image else { return nil }
+        let warped = try warpTrimmed(image, transform: transform, corners: corners)
+        let asset = ImportedImage(image: warped.image, thumbnail: try PixelAdjust.thumbnail(of: warped.image), name: layer.name)
+        var mask = layer.mask
+        if let original = layer.mask, original.placement == nil, original.isLinked {
+            let warpedMask = try warp(original.asset.image, transform: transform, corners: corners, isMask: true)
+            // A uniform mask passes through; any other is cropped with the pixels.
+            let maskAsset: ImportedImage
+            if warpedMask.image === original.asset.image {
+                maskAsset = original.asset
+            } else {
+                guard let cropped = warpedMask.image.cropping(to: warped.crop) else { throw ExportError.render }
+                maskAsset = try LayerMask.asset(from: cropped)
+            }
+            mask = original.replacing(maskAsset)
+        } else if let original = layer.mask, original.isLinked, let placed = original.placement,
+                  case let placement = placed.following(from: layer.transform, to: transform),
+                  case let carried = carried(placement, by: transform, to: corners), isConvex(carried) {
+            // A linked mask placed apart takes the same perspective over its own bounds.
+            let moved = try warpMask(original.asset.image, transform: placement, corners: carried,
+                                     background: LayerMask.background(of: original.asset.thumbnail))
+            mask = LayerMask(asset: moved.image === original.asset.image ? original.asset : try LayerMask.asset(from: moved.image),
+                             isEnabled: original.isEnabled, placement: moved.transform, isLinked: true)
+        } else if let original = layer.mask {
+            // An unlinked mask keeps its place on the document.
+            mask?.placement = original.placement ?? layer.transform
+        }
+        return DistortedLayer(source: layer, transform: transform, corners: corners,
+                              asset: asset, placed: warped.transform, mask: mask)
+    }
+
+    /// Layers already distorted off the main thread for the Apply in progress (see `applyTransform`), by layer.
+    @TaskLocal static var rendered: [UUID: DistortedLayer] = [:]
+}
+
+/// A layer distorted into its new shape (`DistortWarp.distort`), ready to replace the layer's pixels and mask.
+nonisolated struct DistortedLayer: Sendable {
+    /// What it was made from, so it is only used for that same layer and shape.
+    let source: ImageLayer
+    let transform: LayerTransform
+    let corners: [CGPoint]
+    let asset: ImportedImage
+    let placed: LayerTransform
+    let mask: LayerMask?
+
+    func matches(_ layer: ImageLayer, transform: LayerTransform, corners: [CGPoint]) -> Bool {
+        layer.asset?.image === source.asset?.image && layer.transform == source.transform && layer.name == source.name
+            && layer.mask == source.mask && self.transform == transform && self.corners == corners
+    }
 }
 
 /// The canvas's last warped preview, reused while the distortion and layer are unchanged.
@@ -335,8 +388,47 @@ extension EditorSession {
         return result
     }
 
+    /// Apply: a pending distortion or floating selection is resampled off the main thread first — the preview stays up
+    /// while other edits wait — then applied like any transform. Anything else applies at once.
+    func applyTransform() async {
+        guard !isProjectBusy else { return }
+        if let edit = transformEdit, let floating = edit.floating { await applyFloatingTransform(edit, floating); return }
+        guard let edit = transformEdit, let shape = edit.corners, !edit.mask else { commitTransform(); return }
+        let jobs = (edit.group.map { Array($0.originals.keys) } ?? [edit.layerID]).compactMap { id -> DistortJob? in
+            guard let layer = document?.layers.first(where: { $0.id == id }),
+                  let target = distortTarget(for: layer, edit: edit, shape: shape) else { return nil }
+            return DistortJob(layer: layer, transform: target.transform, corners: target.corners)
+        }
+        isProjectBusy = true
+        defer { isProjectBusy = false }
+        let rendered = await Task.detached(priority: .userInitiated) { () -> [UUID: DistortedLayer] in
+            var rendered: [UUID: DistortedLayer] = [:]
+            // A failure is left for the commit to meet again and report.
+            for job in jobs { rendered[job.layer.id] = try? DistortWarp.distort(job.layer, transform: job.transform, corners: job.corners) }
+            return rendered
+        }.value
+        // Cancelled meanwhile, or another layer's edit: there is nothing of this one left to apply.
+        guard let pending = transformEdit, pending.layerID == edit.layerID, pending.corners != nil else {
+            ToolLog.staleResult("Distort")
+            return
+        }
+        // Whatever no longer matches (the corners nudged meanwhile) is redone by the commit itself.
+        DistortWarp.$rendered.withValue(rendered) { commitTransform() }
+    }
+
+    /// For callers that need the pending transform in the document before they go on (Save, Merge, a tool switch):
+    /// Apply, which renders resampling off the main thread, then a plain commit for whatever is still pending — a
+    /// result dropped because the edit changed meanwhile, or an Apply that couldn't start while the session was busy.
+    func settleTransform() async {
+        guard transformEdit != nil else { return }
+        if pendingTransformResamples, !isProjectBusy { await applyTransform() }
+        commitTransform()
+    }
+
     /// Apply for a distortion: each distorted layer's pixels and mask are resampled into its shape, as one undo step.
+    /// Uses what `applyTransform` already rendered where it still matches.
     func commitDistort(_ edit: TransformEdit, corners shape: [CGPoint]) {
+        let rendered = DistortWarp.rendered
         distortPreviewCache = [:]
         defer { distortEffectsCache = [:] }
         let ids = edit.group.map { Array($0.originals.keys) } ?? [edit.layerID]
@@ -348,46 +440,25 @@ extension EditorSession {
             // rendered the effects for the layer's new pixels, or they blink off for a frame on Apply.
             let warpedEffects = effectsPreviews.rendered(id)
                 .flatMap { distortedEffects(for: layer, effects: $0.image, inset: $0.inset, target: target) }
-            do { try distort(at: index, transform: target.transform, corners: target.corners) }
-            catch { brushError = error.localizedDescription }
+            do {
+                let ready = rendered[id].flatMap { $0.matches(layer, transform: target.transform, corners: target.corners) ? $0 : nil }
+                if let distorted = try ready ?? DistortWarp.distort(layer, transform: target.transform, corners: target.corners) {
+                    document?.layers[index].asset = distorted.asset
+                    document?.layers[index].transform = distorted.placed
+                    document?.layers[index].mask = distorted.mask
+                }
+            } catch { brushError = error.localizedDescription }
             // Placed where it was warped to: applying a distortion also crops the layer, so the margins around it
             // are no longer even and an inset could not put it back in the right place.
             if let warpedEffects { effectsPreviews.seed(id, image: warpedEffects.image, placement: warpedEffects.transform) }
         }
         endEdit()
     }
+}
 
-    /// The layer at `index`, shown by `transform`, resampled so its corners land on `corners`.
-    private func distort(at index: Int, transform: LayerTransform, corners: [CGPoint]) throws {
-        guard let layer = document?.layers[index], let image = layer.asset?.image else { return }
-        let warped = try DistortWarp.warpTrimmed(image, transform: transform, corners: corners)
-        let asset = ImportedImage(image: warped.image, thumbnail: try PixelAdjust.thumbnail(of: warped.image), name: layer.name)
-        var mask = layer.mask
-        if let original = layer.mask, original.placement == nil, original.isLinked {
-            let warpedMask = try DistortWarp.warp(original.asset.image, transform: transform, corners: corners, isMask: true)
-            // A uniform mask passes through; any other is cropped with the pixels.
-            let maskAsset: ImportedImage
-            if warpedMask.image === original.asset.image {
-                maskAsset = original.asset
-            } else {
-                guard let cropped = warpedMask.image.cropping(to: warped.crop) else { throw ExportError.render }
-                maskAsset = try LayerMask.asset(from: cropped)
-            }
-            mask = original.replacing(maskAsset)
-        } else if let original = layer.mask, original.isLinked, let placed = original.placement,
-                  case let placement = placed.following(from: layer.transform, to: transform),
-                  case let carried = DistortWarp.carried(placement, by: transform, to: corners), DistortWarp.isConvex(carried) {
-            // A linked mask placed apart takes the same perspective over its own bounds.
-            let moved = try DistortWarp.warpMask(original.asset.image, transform: placement, corners: carried,
-                                                 background: LayerMask.background(of: original.asset.thumbnail))
-            mask = LayerMask(asset: moved.image === original.asset.image ? original.asset : try LayerMask.asset(from: moved.image),
-                             isEnabled: original.isEnabled, placement: moved.transform, isLinked: true)
-        } else if let original = layer.mask {
-            // An unlinked mask keeps its place on the document.
-            mask?.placement = original.placement ?? layer.transform
-        }
-        document?.layers[index].asset = asset
-        document?.layers[index].transform = warped.transform
-        document?.layers[index].mask = mask
-    }
+/// One layer of a distortion to render off the main thread.
+private nonisolated struct DistortJob: Sendable {
+    let layer: ImageLayer
+    let transform: LayerTransform
+    let corners: [CGPoint]
 }

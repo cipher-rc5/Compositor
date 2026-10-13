@@ -31,11 +31,13 @@ nonisolated final class LiveMaskRenderer {
             let rect = CGRect(x: 0, y: 0, width: w, height: h)
             BrushRaster.draw(original, in: rect, mask: false, context: base)
             BrushRaster.draw(adjusted, in: rect, mask: false, context: top)
-            let pixels = base.data!.assumingMemoryBound(to: UInt8.self)
-            let coverage = alpha.data!.assumingMemoryBound(to: UInt8.self)
+            // Contexts made with their own storage always have it; without it the adjustment is skipped, as above.
+            guard let pixels = base.data?.assumingMemoryBound(to: UInt8.self),
+                  let coverage = alpha.data?.assumingMemoryBound(to: UInt8.self),
+                  let topPixels = top.data?.assumingMemoryBound(to: UInt8.self) else { return }
             layer_extract_alpha(pixels, base.bytesPerRow, coverage, alpha.bytesPerRow, w, h)
             layer_unpremultiply_opaque(pixels, base.bytesPerRow, w, h)
-            layer_unpremultiply_opaque(top.data!.assumingMemoryBound(to: UInt8.self), top.bytesPerRow, w, h)
+            layer_unpremultiply_opaque(topPixels, top.bytesPerRow, w, h)
             guard let foreground = top.makeImage() else { return }
             base.setBlendMode(blendMode(id).cgMode)
             base.translateBy(x: 0, y: CGFloat(h)); base.scaleBy(x: 1, y: -1)

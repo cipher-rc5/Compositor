@@ -183,8 +183,31 @@ struct LevelsTests {
         #expect(edit.settings == first)
         session.cancelLevels()
     }
-    @Test func panelPreview() async throws {
-        guard ProcessInfo.processInfo.environment["LEVELS_PREVIEW"] == "1" else { return }
+    /// A layer past the preview limit opens the panel at once, reading the layer itself; the smaller copy previews and
+    /// the histogram read is made off the main actor, and previews wait for it rather than render at full size.
+    @Test func aLargeLayerIsCopiedForPreviewsInTheBackground() async throws {
+        let session = EditorSession()
+        session.createDocument(width: 400, height: 1)
+        let width = Int(LevelsEdit.previewLimit) + 400
+        let wide = try image(Array(repeating: [64, 64, 64, 255], count: width))
+        session.insert(ImportedImage(image: wide, thumbnail: wide, name: "Wide"))
+        session.beginLevels()
+        let edit = try #require(session.levels)
+        #expect(edit.previewSource === wide && edit.awaitsPreviewCopy, "nothing was drawn while the panel opened")
+        var settings = LevelsSettings(); settings.current = LevelRange(outputBlack: 255, outputWhite: 0)
+        session.updateLevels(settings, preview: true)
+        #expect(edit.previewTask == nil, "the preview waits for the copy")
+        await edit.histogramTask?.value
+        #expect(edit.previewSource.width == Int(LevelsEdit.previewLimit) && !edit.awaitsPreviewCopy)
+        #expect(edit.histogramReady && edit.histogramError == nil && edit.histogram[1][64] == LevelsEdit.previewLimit)
+        await edit.previewTask?.value
+        let preview = try bytes(#require(edit.preparedPreview))
+        #expect(preview.count == Int(LevelsEdit.previewLimit) * 4 && preview[0] == 191 && edit.previewError == nil)
+        session.cancelLevels()
+    }
+    /// Writes the panel to /tmp for a look by eye; skipped (and reported as skipped) unless LEVELS_PREVIEW=1.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["LEVELS_PREVIEW"] == "1", "set LEVELS_PREVIEW=1 to render the panel"))
+    func panelPreview() async throws {
         let session = try session(); session.beginLevels()
         await session.levels?.histogramTask?.value
         let view = NSHostingView(rootView: LevelsSheet(session: session))

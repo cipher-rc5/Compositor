@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import os
 
 nonisolated struct ShortcutChord: Codable, Equatable, Hashable {
     var key: String
@@ -79,7 +80,7 @@ struct ShortcutDefinition: Identifiable {
             entry("Close Project", "w", 1, menu: true), entry("Fit Canvas", "0", 1, menu: true),
             entry("Actual Pixels", "1", 1, menu: true), entry("Zoom In", "=", 1, menu: true),
             entry("Zoom Out", "-", 1, menu: true), entry("Show Transform Controls", "h", 1, menu: true),
-            entry("Hide Compositor", "h", 3, menu: true), entry("Cut", "x", 1, menu: true),
+            entry("Hide Others", "h", 3, menu: true), entry("Cut", "x", 1, menu: true),
             entry("Copy", "c", 1, menu: true), entry("Copy Merged", "c", 9, menu: true),
             entry("Paste", "v", 1, menu: true), entry("Fill with Foreground", "\u{7f}", 2, menu: true),
             entry("Fill with Background", "\u{7f}", 1, menu: true), entry("Content-Aware Fill", "\u{7f}", 8, menu: true),
@@ -132,10 +133,53 @@ final class ShortcutSettings {
     private(set) var overrides: [String: ShortcutChord] = [:]
     @ObservationIgnored private let panel = FloatingPanelController(name: "keyboardShortcuts")
     private static let storageKey = "keyboardShortcuts.v1"
+    /// Commands saved under an earlier, wrong name. ⌥⌘H was listed as "Hide Compositor" but has always been the menu's
+    /// Hide Others, so an override saved for it carries over.
+    private static let renamed = ["Menus:Hide Compositor": "Menus:Hide Others"]
+    /// Apply and Cancel are shared by dialogs, whose text fields would lose a plain key to them.
+    private static let dialogActions: Set<String> = ["Canvas & Layers:Apply current canvas operation",
+                                                     "Canvas & Layers:Cancel current canvas operation"]
+    private static let log = Logger.compositor("Shortcuts")
     private init() {
-        if let data = UserDefaults.standard.data(forKey: Self.storageKey),
-           let saved = try? JSONDecoder().decode([String: ShortcutChord].self, from: data),
-           Self.problem(in: saved) == nil { overrides = saved }
+        if let data = UserDefaults.standard.data(forKey: Self.storageKey) { overrides = Self.overrides(from: data) }
+    }
+
+    /// The saved overrides that still make sense. One damaged, unknown (a command since renamed or removed) or
+    /// clashing entry is dropped and logged on its own, rather than taking every other customization with it.
+    static func overrides(from data: Data) -> [String: ShortcutChord] {
+        /// One entry's chord, or nil when it doesn't decode.
+        nonisolated struct Entry: Decodable {
+            let chord: ShortcutChord?
+            init(from decoder: any Decoder) throws { chord = try? ShortcutChord(from: decoder) }
+        }
+        let saved: [String: Entry]
+        do { saved = try JSONDecoder().decode([String: Entry].self, from: data) }
+        catch {
+            log.error("Ignoring saved keyboard shortcuts that don’t decode: \(error.localizedDescription, privacy: .public)")
+            return [:]
+        }
+        let known = Set(ShortcutDefinition.all.map(\.id))
+        var kept: [String: ShortcutChord] = [:]
+        // Sorted, so which of two clashing entries survives doesn't change from launch to launch.
+        for (savedID, entry) in saved.sorted(by: { $0.key < $1.key }) {
+            let id = renamed[savedID] ?? savedID
+            guard known.contains(id) else {
+                log.error("Ignoring a saved shortcut for an unknown command: \(id, privacy: .public)")
+                continue
+            }
+            guard let chord = entry.chord else {
+                log.error("Ignoring a damaged saved shortcut for \(id, privacy: .public)")
+                continue
+            }
+            var candidate = kept
+            candidate[id] = chord
+            if let problem = problem(in: candidate) {
+                log.error("Ignoring the saved shortcut for \(id, privacy: .public): \(problem, privacy: .public)")
+                continue
+            }
+            kept = candidate
+        }
+        return kept
     }
     func chord(_ definition: ShortcutDefinition) -> ShortcutChord { overrides[definition.id] ?? definition.original }
     func menu(_ key: KeyEquivalent, modifiers: EventModifiers) -> ShortcutChord {
@@ -157,7 +201,17 @@ final class ShortcutSettings {
     }
     func close() { panel.close() }
     func save(_ values: [String: ShortcutChord]) {
-        guard Self.problem(in: values) == nil, let data = try? JSONEncoder().encode(values) else { return }
+        // The sheet disables Save while there's a problem, so either of these is a bug worth hearing about.
+        if let problem = Self.problem(in: values) {
+            Self.log.fault("Refusing to save keyboard shortcuts: \(problem, privacy: .public)")
+            return
+        }
+        let data: Data
+        do { data = try JSONEncoder().encode(values) }
+        catch {
+            Self.log.fault("Couldn’t encode keyboard shortcuts: \(error.localizedDescription, privacy: .public)")
+            return
+        }
         overrides = values
         UserDefaults.standard.set(data, forKey: Self.storageKey)
         close()
@@ -169,6 +223,10 @@ final class ShortcutSettings {
             guard chord.key.count == 1, (0...15).contains(chord.modifiers) else { return "Choose a single key with optional modifiers." }
             if definition.group == "Text Editing", chord.modifiers & 7 == 0 {
                 return "Text-editing shortcuts need Command, Option, or Control so they do not replace normal typing."
+            }
+            // Return and Esc already mean Apply and Cancel in a text field; any other plain key would be typed.
+            if dialogActions.contains(definition.id), chord.modifiers & 7 == 0, !["\r", "\u{1b}"].contains(chord.key) {
+                return "\(definition.title) needs Command, Option, or Control unless it is on Return or Esc, so it does not fire while typing in a dialog."
             }
             if [ShortcutChord("q", 1), ShortcutChord(",", 1), ShortcutChord("m", 3)].contains(chord) {
                 return "\(chord.label) is reserved by macOS."

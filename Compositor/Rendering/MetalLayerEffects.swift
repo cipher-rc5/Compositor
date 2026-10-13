@@ -1,11 +1,18 @@
 import AppKit
 import Metal
+import os
 
 /// Layer effects on the GPU: the outline's reach and the shadow's blur are the two heavy passes, and both are
 /// separable, so each runs as a row pass and a column pass over the same pixels. Falls back to the CPU renderer
 /// when Metal isn't available (see `LayerEffectsRenderer`).
-nonisolated final class MetalLayerEffects: @unchecked Sendable {
-    static let shared: MetalLayerEffects? = try? MetalLayerEffects()
+nonisolated final class MetalLayerEffects: Sendable {
+    static let shared: MetalLayerEffects? = {
+        do { return try MetalLayerEffects() } catch {
+            // The CPU path gives the same pixels, only slower; say so, or a slow machine has no explanation.
+            Logger.compositor("Effects").error("Layer effects render on the CPU: Metal is unavailable (\(String(describing: error), privacy: .public))")
+            return nil
+        }
+    }()
     private let device: MTLDevice
     private let queue: MTLCommandQueue
     private let alpha: MTLComputePipelineState
@@ -56,6 +63,12 @@ nonisolated final class MetalLayerEffects: @unchecked Sendable {
     /// `pixels` — a layer's pixels as they are shown, with room around them for the effects — with its stroke and
     /// drop shadow composited around them. The result is the same size.
     func render(_ pixels: CGImage, effects: LayerEffects) throws -> CGImage {
+        try renderCountingPlanes(pixels, effects: effects).image
+    }
+
+    /// `render`, and how many full-size float planes it allocated: only what the enabled effects need, so a layer
+    /// with just a stroke doesn't pay for a glow's buffers (at 80 MP each plane is 320 MB).
+    func renderCountingPlanes(_ pixels: CGImage, effects: LayerEffects) throws -> (image: CGImage, planes: Int) {
         let width = pixels.width, height = pixels.height
         let count = width * height
         guard count > 0, count <= 80_000_000 else { throw ExportError.tooLarge }
@@ -64,13 +77,25 @@ nonisolated final class MetalLayerEffects: @unchecked Sendable {
         // Through BrushRaster, which turns the image the right way up for this context's top-left coordinates.
         BrushRaster.draw(pixels, in: CGRect(x: 0, y: 0, width: width, height: height), mask: false, context: source)
         guard let bytes = source.data else { throw ExportError.render }
-        let stride = MemoryLayout<Float>.stride
+        var planes = 0
+        func plane() throws -> MTLBuffer {
+            guard let buffer = device.makeBuffer(length: count * MemoryLayout<Float>.stride, options: .storageModePrivate) else { throw ExportError.render }
+            planes += 1
+            return buffer
+        }
+        // Every blur's row pass writes here and its column pass reads it back, one blur after another, so they share it.
+        var sharedScratch: MTLBuffer?
+        func scratch() throws -> MTLBuffer {
+            if let sharedScratch { return sharedScratch }
+            let made = try plane()
+            sharedScratch = made
+            return made
+        }
         guard let input = device.makeBuffer(bytes: bytes, length: count * 4, options: .storageModeShared),
               let output = device.makeBuffer(length: count * 4, options: .storageModeShared),
-              let first = device.makeBuffer(length: count * stride, options: .storageModeShared),
-              let second = device.makeBuffer(length: count * stride, options: .storageModeShared),
-              let third = device.makeBuffer(length: count * stride, options: .storageModeShared),
               let command = queue.makeCommandBuffer(), let encoder = command.makeComputeCommandEncoder() else { throw ExportError.render }
+        // first: the shape's own coverage, which everything else starts from.
+        let first = try plane()
         let grid = MTLSize(width: width, height: height, depth: 1)
         let group = MTLSize(width: 16, height: 16, depth: 1)
         func run(_ state: MTLComputePipelineState, _ buffers: [(MTLBuffer, Int)], _ uniforms: UnsafeRawPointer, _ length: Int) {
@@ -82,97 +107,77 @@ nonisolated final class MetalLayerEffects: @unchecked Sendable {
             // reads half-written pixels — which showed up as effects that only appeared once the stroke ended.
             encoder.memoryBarrier(scope: .buffers)
         }
-        // first: the shape's own coverage.
+        func blur(_ from: MTLBuffer, into: MTLBuffer, sigma: Float) throws {
+            var blur = Blur(width: UInt32(width), height: UInt32(height), sigma: sigma,
+                            radius: UInt32(max(1, Int((sigma * 3).rounded()))))
+            let between = try scratch()
+            run(blurRows, [(from, 0), (between, 1)], &blur, MemoryLayout<Blur>.stride)
+            run(blurColumns, [(between, 0), (into, 1)], &blur, MemoryLayout<Blur>.stride)
+        }
         var size = Spread(width: UInt32(width), height: UInt32(height), reach: 0, smallest: 0)
         run(alpha, [(input, 0), (first, 1)], &size, MemoryLayout<Spread>.stride)
 
         let stroke = effects.stroke.flatMap { $0.isEnabled && $0.size > 0 && $0.opacity > 0 ? $0 : nil }
+        var ringBuffer: MTLBuffer?
         if let stroke {
-            // second: the shape reached out (or pulled in) by the stroke's size; third: the ring between them.
+            // The shape reached out (or pulled in) by the stroke's size, then the ring between the two.
+            let reached = try plane(), ring = try plane()
             var spread = Spread(width: UInt32(width), height: UInt32(height),
                                 reach: UInt32(max(1, Int(stroke.size.rounded()))), smallest: stroke.inside ? 1 : 0)
-            run(spreadRows, [(first, 0), (third, 1)], &spread, MemoryLayout<Spread>.stride)
-            run(spreadColumns, [(third, 0), (second, 1)], &spread, MemoryLayout<Spread>.stride)
-            run(ring, [(first, 0), (second, 1), (third, 2)], &spread, MemoryLayout<Spread>.stride)
+            run(spreadRows, [(first, 0), (ring, 1)], &spread, MemoryLayout<Spread>.stride)
+            run(spreadColumns, [(ring, 0), (reached, 1)], &spread, MemoryLayout<Spread>.stride)
+            run(self.ring, [(first, 0), (reached, 1), (ring, 2)], &spread, MemoryLayout<Spread>.stride)
+            ringBuffer = ring
+            // Done with: the shadow can have it.
+            sharedScratch = sharedScratch ?? reached
         }
         let shadow = effects.shadow.flatMap { $0.isEnabled && $0.opacity > 0 ? $0 : nil }
+        var shadowBuffer: MTLBuffer?
         if let shadow {
-            // second: the shape moved and softened.
-            var moved = Shift(width: UInt32(width), height: UInt32(height),
+            // The shape moved and softened.
+            let moved = try plane()
+            var shift = Shift(width: UInt32(width), height: UInt32(height),
                               dx: Float(shadow.offset.width), dy: Float(shadow.offset.height))
-            run(shift, [(first, 0), (second, 1)], &moved, MemoryLayout<Shift>.stride)
+            run(self.shift, [(first, 0), (moved, 1)], &shift, MemoryLayout<Shift>.stride)
             let sigma = Float(shadow.blur / 2)
-            if sigma > 0.01 {
-                var blur = Blur(width: UInt32(width), height: UInt32(height), sigma: sigma,
-                                radius: UInt32(max(1, Int((sigma * 3).rounded()))))
-                // The ring is already in `third`, so the blur borrows the coverage buffer for its row pass.
-                guard let scratch = device.makeBuffer(length: count * stride, options: .storageModeShared) else { throw ExportError.render }
-                run(blurRows, [(second, 0), (scratch, 1)], &blur, MemoryLayout<Blur>.stride)
-                run(blurColumns, [(scratch, 0), (second, 1)], &blur, MemoryLayout<Blur>.stride)
-            }
+            if sigma > 0.01 { try blur(moved, into: moved, sigma: sigma) }
+            shadowBuffer = moved
         }
         let overlay = effects.colorOverlay.flatMap { $0.isEnabled && $0.opacity > 0 ? $0 : nil }
         let innerShadow = effects.innerShadow.flatMap { $0.isEnabled && $0.opacity > 0 ? $0 : nil }
         var innerBuffer: MTLBuffer?
         if let innerShadow {
             // What lies outside the layer, moved and softened, kept to the layer's own shape.
-            guard let moved = device.makeBuffer(length: count * stride, options: .storageModeShared),
-                  let softened = device.makeBuffer(length: count * stride, options: .storageModeShared),
-                  let result = device.makeBuffer(length: count * stride, options: .storageModeShared) else { throw ExportError.render }
+            let moved = try plane(), result = try plane()
             var shift = Shift(width: UInt32(width), height: UInt32(height),
                               dx: Float(innerShadow.offset.width), dy: Float(innerShadow.offset.height))
             run(self.shift, [(first, 0), (moved, 1)], &shift, MemoryLayout<Shift>.stride)
             let sigma = Float(innerShadow.blur / 2)
-            if sigma > 0.01 {
-                var blur = Blur(width: UInt32(width), height: UInt32(height), sigma: sigma,
-                                radius: UInt32(max(1, Int((sigma * 3).rounded()))))
-                run(blurRows, [(moved, 0), (softened, 1)], &blur, MemoryLayout<Blur>.stride)
-                run(blurColumns, [(softened, 0), (moved, 1)], &blur, MemoryLayout<Blur>.stride)
-            }
-            var size = Spread(width: UInt32(width), height: UInt32(height), reach: 0, smallest: 0)
-            run(self.inside, [(first, 0), (moved, 1), (result, 2)], &size, MemoryLayout<Spread>.stride)
+            if sigma > 0.01 { try blur(moved, into: moved, sigma: sigma) }
+            run(inside, [(first, 0), (moved, 1), (result, 2)], &size, MemoryLayout<Spread>.stride)
             innerBuffer = result
         }
-        guard let inner = innerBuffer ?? device.makeBuffer(length: count * stride, options: .storageModeShared) else { throw ExportError.render }
-        let glow = effects.outerGlow.flatMap { $0.isEnabled && $0.size > 0 && $0.opacity > 0 ? $0 : nil }
-        var glowBuffer: MTLBuffer?
-        if let glow {
-            guard let blurredGlow = device.makeBuffer(length: count * stride, options: .storageModeShared),
-                  let scratch = device.makeBuffer(length: count * stride, options: .storageModeShared) else { throw ExportError.render }
-            let sigma = Float(glow.size / 2)
+        // A glow's coverage: the shape softened by its size (or the shape itself, for a size too small to blur).
+        func softened(by glowSize: CGFloat) throws -> MTLBuffer {
+            let result = try plane()
+            let sigma = Float(glowSize / 2)
             if sigma > 0.01 {
-                var blur = Blur(width: UInt32(width), height: UInt32(height), sigma: sigma,
-                                radius: UInt32(max(1, Int((sigma * 3).rounded()))))
-                run(blurRows, [(first, 0), (scratch, 1)], &blur, MemoryLayout<Blur>.stride)
-                run(blurColumns, [(scratch, 0), (blurredGlow, 1)], &blur, MemoryLayout<Blur>.stride)
+                try blur(first, into: result, sigma: sigma)
             } else {
                 var zeroShift = Shift(width: UInt32(width), height: UInt32(height), dx: 0, dy: 0)
-                run(shift, [(first, 0), (blurredGlow, 1)], &zeroShift, MemoryLayout<Shift>.stride)
+                run(shift, [(first, 0), (result, 1)], &zeroShift, MemoryLayout<Shift>.stride)
             }
-            glowBuffer = blurredGlow
+            return result
         }
-        guard let glowOutput = glowBuffer ?? device.makeBuffer(length: count * stride, options: .storageModeShared) else { throw ExportError.render }
+        let glow = effects.outerGlow.flatMap { $0.isEnabled && $0.size > 0 && $0.opacity > 0 ? $0 : nil }
+        let glowBuffer = try glow.map { try softened(by: $0.size) }
         let innerGlow = effects.innerGlow.flatMap { $0.isEnabled && $0.size > 0 && $0.opacity > 0 ? $0 : nil }
         var innerGlowBuffer: MTLBuffer?
         if let innerGlow {
-            guard let blurredGlow = device.makeBuffer(length: count * stride, options: .storageModeShared),
-                  let scratch = device.makeBuffer(length: count * stride, options: .storageModeShared),
-                  let result = device.makeBuffer(length: count * stride, options: .storageModeShared) else { throw ExportError.render }
-            let sigma = Float(innerGlow.size / 2)
-            if sigma > 0.01 {
-                var blur = Blur(width: UInt32(width), height: UInt32(height), sigma: sigma,
-                                radius: UInt32(max(1, Int((sigma * 3).rounded()))))
-                run(blurRows, [(first, 0), (scratch, 1)], &blur, MemoryLayout<Blur>.stride)
-                run(blurColumns, [(scratch, 0), (blurredGlow, 1)], &blur, MemoryLayout<Blur>.stride)
-            } else {
-                var zeroShift = Shift(width: UInt32(width), height: UInt32(height), dx: 0, dy: 0)
-                run(shift, [(first, 0), (blurredGlow, 1)], &zeroShift, MemoryLayout<Shift>.stride)
-            }
-            var size = Spread(width: UInt32(width), height: UInt32(height), reach: 0, smallest: 0)
-            run(inside, [(first, 0), (blurredGlow, 1), (result, 2)], &size, MemoryLayout<Spread>.stride)
+            let blurred = try softened(by: innerGlow.size), result = try plane()
+            run(inside, [(first, 0), (blurred, 1), (result, 2)], &size, MemoryLayout<Spread>.stride)
             innerGlowBuffer = result
         }
-        guard let innerGlowOutput = innerGlowBuffer ?? device.makeBuffer(length: count * stride, options: .storageModeShared) else { throw ExportError.render }
         var settings = Compose(width: UInt32(width), height: UInt32(height),
             strokeColor: SIMD4(Float(stroke?.color.red ?? 0), Float(stroke?.color.green ?? 0),
                                Float(stroke?.color.blue ?? 0), Float(stroke?.opacity ?? 0)),
@@ -189,7 +194,11 @@ nonisolated final class MetalLayerEffects: @unchecked Sendable {
             flags: SIMD4(stroke != nil ? 1 : 0, stroke?.inside == true ? 1 : 0, shadow != nil ? 1 : 0,
                          innerShadow != nil ? 1 : 0),
             more: SIMD4(overlay != nil ? 1 : 0, glow != nil ? 1 : 0, innerGlow != nil ? 1 : 0, 0))
-        run(compose, [(input, 0), (third, 1), (second, 2), (output, 3), (inner, 4), (first, 5), (glowOutput, 6), (innerGlowOutput, 7)], &settings, MemoryLayout<Compose>.stride)
+        // The compose pass only reads a plane its flag turns on; the shape's coverage fills in for the rest, as
+        // every binding still needs a buffer.
+        run(compose, [(input, 0), (ringBuffer ?? first, 1), (shadowBuffer ?? first, 2), (output, 3),
+                      (innerBuffer ?? first, 4), (first, 5), (glowBuffer ?? first, 6), (innerGlowBuffer ?? first, 7)],
+            &settings, MemoryLayout<Compose>.stride)
         encoder.endEncoding()
         command.commit()
         command.waitUntilCompleted()
@@ -203,7 +212,7 @@ nonisolated final class MetalLayerEffects: @unchecked Sendable {
                                   bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue),
                                   provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
         else { throw ExportError.render }
-        return image
+        return (image, planes)
     }
 
     private static let source = """

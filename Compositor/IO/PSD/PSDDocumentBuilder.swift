@@ -1,7 +1,7 @@
 import CoreGraphics
 import Foundation
 
-nonisolated struct PSDImport: @unchecked Sendable {
+nonisolated struct PSDImport: Sendable {
     let width: Int
     let height: Int
     let resolution: Double
@@ -25,6 +25,12 @@ nonisolated enum PSDDocumentBuilder {
         var layers: [ImageLayer] = []
         let canvas = CGSize(width: document.width, height: document.height)
         for record in document.layers {
+            if record.isDissolved {
+                let lost = record.mask == nil ? "" : " Its mask was not kept."
+                conversions.append(PSDConversion(layerName: record.name, message:
+                    "Folders can be nested \(PSDReader.maximumFolderDepth) deep. This folder was removed and its layers moved into the folder above.\(lost)"))
+                continue
+            }
             var notes: [String] = []
             if record.kind == .text {
                 notes.append("Editable Photoshop text becomes pixels and can’t be retyped.")
@@ -41,9 +47,6 @@ nonisolated enum PSDDocumentBuilder {
                 } else {
                     notes.append("Vector shape was rasterized to pixels.")
                 }
-            }
-            if record.kind == .other {
-                notes.append("This Photoshop layer type isn’t supported and was imported as pixels.")
             }
             if record.isGroup {
                 if record.blendKey != "pass" && record.blendKey != "norm" {
@@ -77,7 +80,10 @@ nonisolated enum PSDDocumentBuilder {
                                    blendMode: record.blendMode ?? .normal, adjustment: adjustment)
             } else if let image = record.image {
                 let asset = try assets[record.id] ?? imported(image, name: record.name)
-                let origin = CGPoint(x: record.bounds.minX, y: record.bounds.minY)
+                // Projects keep layers within a million pixels of the canvas. Anything further out is far
+                // off the canvas either way, so it is moved in to that edge rather than refused.
+                func clamped(_ value: CGFloat) -> CGFloat { min(1_000_000, max(-1_000_000, value)) }
+                let origin = CGPoint(x: clamped(record.bounds.minX), y: clamped(record.bounds.minY))
                 let size = record.bounds.size.width > 0 && record.bounds.size.height > 0
                     ? record.bounds.size
                     : CGSize(width: image.width, height: image.height)
@@ -117,8 +123,30 @@ nonisolated enum PSDDocumentBuilder {
                 baseForParent[record.parentID] = nil
             }
         }
+        try validate(layers, width: document.width, height: document.height)
         return PSDImport(width: document.width, height: document.height, resolution: document.resolution,
                          layers: layers, conversions: conversions)
+    }
+
+    /// The layers held to the rules a project is saved under. The reader already shapes a file to fit them
+    /// (folder depth, names, budgets); this stops anything it missed from becoming a document that can't be saved.
+    private static func validate(_ layers: [ImageLayer], width: Int, height: Int) throws {
+        let records = layers.map { layer in
+            ProjectLayerRecord(id: layer.id, name: layer.name, isVisible: layer.isVisible, transform: layer.transform,
+                               imageFile: layer.asset == nil ? nil : "\(layer.id.uuidString).png", parentID: layer.parentID,
+                               isGroup: layer.isGroup, opacity: layer.opacity, blendMode: layer.blendMode,
+                               maskFile: layer.mask == nil ? nil : "\(layer.id.uuidString).mask.png", maskEnabled: layer.mask?.isEnabled,
+                               maskSourceID: layer.maskSourceID, adjustment: layer.adjustment, maskPlacement: layer.mask?.placement,
+                               maskLinked: layer.mask?.isLinked, shape: layer.shape?.style, effects: layer.effects)
+        }
+        do {
+            try ProjectStore.validate(ProjectManifest(documentID: UUID(), width: width, height: height,
+                                                      activeLayerID: nil, layers: records))
+        } catch ProjectError.tooLarge {
+            throw ImageImportError.tooLarge
+        } catch {
+            throw PSDError.unrepresentable
+        }
     }
 
     private static func imported(_ image: CGImage, name: String) throws -> ImportedImage {

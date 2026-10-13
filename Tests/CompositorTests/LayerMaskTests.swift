@@ -127,7 +127,7 @@ struct LayerMaskTests {
         // Missing mask assets must fail instead of silently revealing the image.
         let record = try #require(session.projectSnapshot()?.manifest.layers.first)
         try FileManager.default.removeItem(at: url.appendingPathComponent("images").appendingPathComponent(try #require(record.maskFile)))
-        await #expect(throws: (any Error).self) { try await ProjectStore.shared.load(from: url) }
+        await #expect(throws: ProjectError.missingImage) { try await ProjectStore.shared.load(from: url) }
     }
     @Test func masksRejectOlderSchemaAndUnsafePaths() async throws {
         let session = try session()
@@ -225,7 +225,7 @@ struct LayerMaskTests {
         values = try alphas(try await ImageExporter.shared.render(try #require(session.projectSnapshot())).image)
         #expect(values[10 * 40 + 10] == 255 && values[10 * 40 + 30] == 0)
         // Cmd-click on the folder's mask thumbnail selects its black areas.
-        session.loadMaskSelection(layerID: folder)
+        await session.loadMaskSelection(layerID: folder)
         #expect((session.selection?.path.boundingBoxOfPath.width ?? 0) > 30)
         // Selecting the folder's pixels (it has none) still paints nothing.
         session.selectLayerTarget(folder, mask: false)

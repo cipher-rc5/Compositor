@@ -1,4 +1,7 @@
 import AppKit
+import os
+
+private let mergeLog = Logger.compositor("Layers")
 
 extension EditorSession {
     /// What ⌘E merges, in stacking order, and where the result goes; nil when there is nothing to merge.
@@ -30,9 +33,10 @@ extension EditorSession {
     var mergeTitle: String { mergePlan()?.action ?? "Merge Down" }
 
     /// ⌘E: the layers composited as the canvas shows them — blend modes, opacity, masks, clipping and adjustments
-    /// baked in — into one pixel layer, trimmed to what is there, in their place, as one undo step.
-    func mergeLayers() {
-        commitTransform()
+    /// baked in — into one pixel layer, trimmed to what is there, in their place, as one undo step. The composite
+    /// is drawn off the main thread while other edits wait.
+    func mergeLayers() async {
+        await settleTransform()
         guard let plan = mergePlan(), let document else { return }
         let layers = document.layers
         let kept = Set(plan.ids)
@@ -45,15 +49,27 @@ extension EditorSession {
         }
         let flat = CanvasDocument(id: document.id, width: document.width, height: document.height,
                                   layers: subset, resolution: document.resolution)
-        guard let context = try? BrushRaster.context(width: document.width, height: document.height, mask: false) else { return }
-        drawLiveComposite(flat, in: context)
+        let composite = liveComposite(flat)
         let canvas = LayerTransform(origin: .zero, size: CGSize(width: document.width, height: document.height))
-        guard let full = context.makeImage(),
-              let trimmed = try? PixelFilter.trimmed(full, placed: canvas),
-              let thumbnail = try? PixelAdjust.thumbnail(of: trimmed.image) else { NSSound.beep(); return }
-        var merged = ImageLayer(asset: ImportedImage(image: trimmed.image, thumbnail: thumbnail, name: plan.name),
-                                origin: trimmed.transform.origin)
-        merged.transform = trimmed.transform
+        isProjectBusy = true
+        defer { isProjectBusy = false }
+        let name = plan.name
+        let result = await Task.detached(priority: .userInitiated) { () -> Result<(asset: ImportedImage, transform: LayerTransform), any Error> in
+            Result {
+                let trimmed = try PixelFilter.trimmed(try composite.render(), placed: canvas)
+                let thumbnail = try PixelAdjust.thumbnail(of: trimmed.image)
+                return (ImportedImage(image: trimmed.image, thumbnail: thumbnail, name: name), trimmed.transform)
+            }
+        }.value
+        // The merge was planned from these layers; never put it over layers that changed while it was drawn.
+        guard self.document?.layers == layers else {
+            ToolLog.staleResult("Merge")
+            return
+        }
+        let made: (asset: ImportedImage, transform: LayerTransform)
+        do { made = try result.get() } catch { reportMergeFailure(plan.action, error); return }
+        var merged = ImageLayer(asset: made.asset, origin: made.transform.origin)
+        merged.transform = made.transform
         merged.name = plan.name
         merged.parentID = plan.parent
         var next = layers.filter { !plan.removed.contains($0.id) }
@@ -62,11 +78,17 @@ extension EditorSession {
         let slot = layers.firstIndex { $0.id == plan.anchor } ?? layers.count
         let insertion = slot - layers[..<slot].filter { plan.removed.contains($0.id) }.count
         next.insert(merged, at: min(max(0, insertion), next.count))
-        guard (try? LayerHierarchy.validate(next.map(\.hierarchyRecord))) != nil else { NSSound.beep(); return }
+        do { try LayerHierarchy.validate(next.map(\.hierarchyRecord)) } catch { reportMergeFailure(plan.action, error); return }
         finishOpacityEdit()
         beginEdit(plan.action)
         self.document?.layers = next
         activeLayerID = merged.id
         endEdit()
+    }
+
+    /// A merge that couldn't be made (usually memory, on a large canvas) leaves the layers as they were, and says so.
+    private func reportMergeFailure(_ action: String, _ error: any Error) {
+        mergeLog.error("\(action, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
+        brushError = "\(action) didn’t work: \(error.localizedDescription)"
     }
 }

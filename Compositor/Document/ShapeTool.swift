@@ -34,7 +34,7 @@ nonisolated struct LayerShapeStyle: Codable, Equatable, Sendable {
 /// A layer made with the Shape tool. Its pixels are an ordinary raster, so it clips, masks, blends and filters like
 /// any layer; `image` is the raster the shape drew. Once anything else changes those pixels (painting, a filter),
 /// the layer's image is no longer this one and the layer is plain pixels from then on.
-nonisolated struct LayerShape: Equatable, @unchecked Sendable {
+nonisolated struct LayerShape: Equatable, Sendable {
     var style: LayerShapeStyle
     let image: CGImage
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.style == rhs.style && lhs.image === rhs.image }
@@ -121,7 +121,9 @@ extension EditorSession {
         // thickness (and its round ends) around them.
         var ends: (start: CGPoint, end: CGPoint)?
         if draft.kind == .line {
-            let from = draft.anchor, to = draft.end ?? draft.anchor
+            // A line's box is grown by its thickness, so a click alone would still make a dot: it needs a drag.
+            guard let to = draft.end, hypot(to.x - draft.anchor.x, to.y - draft.anchor.y) >= 1 else { return }
+            let from = draft.anchor
             rect = CGRect(x: min(from.x, to.x), y: min(from.y, to.y),
                           width: abs(to.x - from.x), height: abs(to.y - from.y)).insetBy(dx: -thickness / 2, dy: -thickness / 2)
             ends = (from, to)
@@ -131,6 +133,8 @@ extension EditorSession {
             brushError = "That shape is too large. A shape can cover up to 100 megapixels."
             return
         }
+        // Checked before the shape is drawn, so a refused one never takes the memory it would have needed.
+        guard fitsPixelBudget(adding: Int(rect.width) * Int(rect.height), action: "The new shape") else { return }
         do {
             // The ends as fractions of the box, so a scaled line still runs between the same two places.
             func unit(_ point: CGPoint) -> CGPoint {
@@ -149,12 +153,7 @@ extension EditorSession {
     }
 
     /// "Rectangle 1", "Ellipse 2", … skipping names already in the document.
-    func nextShapeName(_ kind: ShapeKind) -> String {
-        let names = Set(document?.layers.map(\.name) ?? [])
-        var number = 1
-        while names.contains("\(kind.rawValue) \(number)") { number += 1 }
-        return "\(kind.rawValue) \(number)"
-    }
+    func nextShapeName(_ kind: ShapeKind) -> String { document?.unusedName(kind.rawValue) ?? "\(kind.rawValue) 1" }
 
     /// A shape layer scaled to a new size draws its shape again at that size, so a rounded corner keeps its radius
     /// instead of stretching. Part of the edit that changed the size.

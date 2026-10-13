@@ -71,10 +71,7 @@ nonisolated struct CameraRawCurveSettings: Equatable, Sendable {
         case .blue: points = blue
         }
         guard let index = points.indices.min(by: { abs(points[$0].x - tone) < abs(points[$1].x - tone) }) else { return self }
-        if index == 0 || index == points.count - 1 { points[index].y = min(1, max(0, points[index].y + delta)) }
-        else {
-            points[index].y = min(1, max(0, points[index].y + delta))
-        }
+        points[index].y = min(1, max(0, points[index].y + delta))
         switch channel {
         case .rgb: result.rgb = points
         case .red: result.red = points
@@ -168,10 +165,14 @@ nonisolated struct CameraRawMixerSettings: Equatable, Sendable {
     }
 
     var normalized: Self {
+        // Exactly one value per family: the kernel reads eight of each, and a short array read past its end.
+        func families(_ values: [Double]) -> [Double] {
+            (0..<Self.names.count).map { values.indices.contains($0) ? ImageAdjustmentPixels.clamp(values[$0], -100...100, 0) : 0 }
+        }
         var result = self
-        result.hue = hue.map { ImageAdjustmentPixels.clamp($0, -100...100, 0) }
-        result.saturation = saturation.map { ImageAdjustmentPixels.clamp($0, -100...100, 0) }
-        result.luminance = luminance.map { ImageAdjustmentPixels.clamp($0, -100...100, 0) }
+        result.hue = families(hue)
+        result.saturation = families(saturation)
+        result.luminance = families(luminance)
         result.points = Array(points.prefix(8)).map(\.normalized)
         return result
     }
@@ -259,6 +260,9 @@ nonisolated extension CameraRawSettings {
         let mixerFloats = mixer.mixerFloats
         let pointFloats = mixer.pointFloats
         let grade = grading.gradeFloats
+        // The kernel's fixed layouts (AdjustPixels.h): reading past a shorter array is memory it doesn't own.
+        precondition(mixerFloats.count == 24 && pointFloats.count == mixer.points.count * 9 && grade.count == 12,
+                     "Camera Raw color arrays don't match the kernel's layout")
         luma.withUnsafeBufferPointer { lumaP in
             red.withUnsafeBufferPointer { redP in
                 green.withUnsafeBufferPointer { greenP in

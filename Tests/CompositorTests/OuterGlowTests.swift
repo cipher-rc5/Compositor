@@ -298,7 +298,9 @@ struct OuterGlowTests {
 
     // MARK: - 6. CPU & Metal Parity Test
 
-    @Test func outerGlowCPUAndMetalParity() throws {
+    /// Without Metal both sides would be the CPU path, and the test would compare it with itself.
+    @Test(.enabled(if: MetalLayerEffects.shared != nil, "needs a Metal device"))
+    func outerGlowCPUAndMetalParity() throws {
         let image = try createSquareImage(size: 40, innerSize: 20, color: .white)
         let glow = OuterGlowEffect(enabled: true, size: 10, red: 0, green: 0.8, blue: 1.0, opacity: 1.0)
         let effects = LayerEffects(outerGlow: glow)

@@ -1,6 +1,8 @@
 import AppKit
 import CoreGraphics
 import CoreImage
+import Synchronization
+import os
 
 /// A line drawn around what the layer shows, outside its edge or inside it.
 nonisolated struct StrokeEffect: Codable, Equatable, Sendable {
@@ -213,7 +215,7 @@ nonisolated enum LayerEffectKind: String, CaseIterable, Sendable {
     case stroke = "Stroke", shadow = "Drop Shadow", colorOverlay = "Color Overlay", innerShadow = "Inner Shadow", outerGlow = "Outer Glow", innerGlow = "Inner Glow"
 }
 
-struct LayerEffectSelection: Equatable {
+struct LayerEffectSelection: Hashable {
     let layerID: UUID
     let kind: LayerEffectKind
 }
@@ -256,7 +258,8 @@ extension EditorSession {
             effects.innerGlow = InnerGlowEffect()
         default: break
         }
-        setEffects(effects, on: id, name: "Add " + kind.rawValue)
+        // The panel that opens next edits the effect just added: adding it and everything done there is one step.
+        setEffects(effects, on: id, name: "Add " + kind.rawValue, coalescing: LayerEffectSelection(layerID: id, kind: kind))
         selectEffect(kind, on: id, editing: true)
         effectsEditingOriginal = original
     }
@@ -291,32 +294,37 @@ extension EditorSession {
             case .outerGlow: effects.outerGlow = original.outerGlow
             case .innerGlow: effects.innerGlow = original.innerGlow
             }
-            setEffects(effects, on: editing.layerID, name: "Cancel " + editing.kind.rawValue)
+            setEffects(effects, on: editing.layerID, name: "Cancel " + editing.kind.rawValue, coalescing: editing)
         }
+        // The panel's changes are one step; whatever comes after it, even the same panel opened again, is another.
+        history.stopCoalescing()
         effectsEditing = nil
         effectsEditingOriginal = nil
         if selectedEffect == nil { effectSelection = nil }
     }
 
-    func setEffects(_ effects: LayerEffects, on id: UUID? = nil, name: String = "Layer Effects") {
+    /// `coalescing` folds this change into the last undo step made with the same key (see `DocumentHistory.begin`).
+    func setEffects(_ effects: LayerEffects, on id: UUID? = nil, name: String = "Layer Effects", coalescing: AnyHashable? = nil) {
         guard canEditLayers, effects.isValid,
               let index = document?.layers.firstIndex(where: { $0.id == (id ?? activeLayerID) }),
               document?.layers[index].isGroup == false, document?.layers[index].asset != nil,
               document?.layers[index].effects != (effects.isEmpty ? nil : effects) else { return }
         finishOpacityEdit()
-        beginEdit(name)
+        history.begin(name, document: document, selection: activeLayerID, coalescing: coalescing)
         document?.layers[index].effects = effects.isEmpty ? nil : effects
         endEdit()
     }
 
-    /// Panel edits stay bound to the layer that opened the panel, even if selection changes.
+    /// Panel edits stay bound to the layer that opened the panel, even if selection changes. Every slider tick and
+    /// picker color lands here, so one panel session is one undo step: they would otherwise fill the history and
+    /// push out everything done before the panel opened.
     func changeEffects(_ change: (inout LayerEffects) -> Void) {
         guard let editing = effectsEditing,
               let layer = document?.layers.first(where: { $0.id == editing.layerID }),
               layer.effects?.contains(editing.kind) == true else { return }
         var effects = layer.effects ?? LayerEffects()
         change(&effects)
-        setEffects(effects, on: layer.id, name: "Edit " + editing.kind.rawValue)
+        setEffects(effects, on: layer.id, name: "Edit " + editing.kind.rawValue, coalescing: editing)
     }
 
     func canCopyEffect(_ kind: LayerEffectKind, from source: UUID, to target: UUID) -> Bool {
@@ -368,43 +376,92 @@ extension EditorSession {
     }
 }
 
+/// Why a layer's effects could not be drawn at full size.
+nonisolated enum LayerEffectsError: LocalizedError, Equatable {
+    /// The margin the effects need would grow the layer past the 100-megapixel drawing budget.
+    case tooLarge
+    /// Export stops rather than leave out effects the canvas shows.
+    case cannotExport(layer: String, reason: String)
+    var errorDescription: String? {
+        switch self {
+        case .tooLarge:
+            "The layer with its effects would be over 100 megapixels."
+        case .cannotExport(let layer, let reason):
+            "The effects on “\(layer)” could not be drawn: \(reason) Lower the drop shadow’s distance or blur, or the outer glow’s size, or hide those effects, and try again."
+        }
+    }
+}
+
 /// Draws a layer's effects around its pixels. The result is the layer as it should appear — shadow behind, stroke
 /// around, pixels on top — on a canvas grown by `inset` pixels on every side, so the caller places it by growing
 /// the layer's transform in the same proportion.
 nonisolated enum LayerEffectsRenderer {
     /// The last few layers drawn with effects, so the canvas doesn't rebuild them on every redraw.
-    private final class Cache: @unchecked Sendable {
-        private let lock = NSLock()
-        private var entries: [(image: CGImage, mask: CGImage?, effects: LayerEffects, result: CGImage, inset: CGFloat)] = []
+    private final class Cache: Sendable {
+        private struct State {
+            var entries: [(image: CGImage, mask: CGImage?, effects: LayerEffects, result: CGImage, inset: CGFloat)] = []
+            /// Failures already logged, so a layer redrawn many times over is reported once, not on every draw.
+            var reported: [(image: ObjectIdentifier, effects: LayerEffects)] = []
+        }
+        private let state = Mutex(State())
+        func hit(image: CGImage, mask: CGImage?, effects: LayerEffects) -> (image: CGImage, inset: CGFloat)? {
+            state.withLock { state in
+                state.entries.first { $0.image === image && $0.mask === mask && $0.effects == effects }.map { ($0.result, $0.inset) }
+            }
+        }
+        /// Whether this failure is new: true once for the same pixels and settings.
+        func firstReport(image: CGImage, effects: LayerEffects) -> Bool {
+            state.withLock { state in
+                guard !state.reported.contains(where: { $0.image == ObjectIdentifier(image) && $0.effects == effects }) else { return false }
+                state.reported.append((ObjectIdentifier(image), effects))
+                if state.reported.count > 32 { state.reported.removeFirst() }
+                return true
+            }
+        }
         func result(image: CGImage, mask: CGImage?, effects: LayerEffects,
                     make: () throws -> (image: CGImage, inset: CGFloat)) throws -> (image: CGImage, inset: CGFloat) {
-            lock.lock()
-            let hit = entries.first { $0.image === image && $0.mask === mask && $0.effects == effects }
-            lock.unlock()
-            if let hit { return (hit.result, hit.inset) }
+            if let hit = hit(image: image, mask: mask, effects: effects) { return hit }
             let made = try make()
-            lock.lock()
             let budget = 64 * 1024 * 1024
             let cost = made.image.bytesPerRow * made.image.height + image.bytesPerRow * image.height + (mask.map { $0.bytesPerRow * $0.height } ?? 0)
-            if cost <= budget {
-                entries.append((image, mask, effects, made.image, made.inset))
-                while entries.count > 8 || entries.reduce(0, { $0 + $1.result.bytesPerRow * $1.result.height + $1.image.bytesPerRow * $1.image.height + ($1.mask.map { $0.bytesPerRow * $0.height } ?? 0) }) > budget {
-                    entries.removeFirst()
+            guard cost <= budget else { return made }
+            state.withLock { state in
+                state.entries.append((image, mask, effects, made.image, made.inset))
+                while state.entries.count > 8 || state.entries.reduce(0, { $0 + $1.result.bytesPerRow * $1.result.height + $1.image.bytesPerRow * $1.image.height + ($1.mask.map { $0.bytesPerRow * $0.height } ?? 0) }) > budget {
+                    state.entries.removeFirst()
                 }
             }
-            lock.unlock()
             return made
         }
     }
     private static let cache = Cache()
+    private static let log = Logger.compositor("Effects")
 
     /// `image` with `effects` around it, reusing the last result for the same pixels, mask and settings. Nil when
-    /// there is nothing to draw or the effects can't be made, so the caller draws the layer as it is.
+    /// there is nothing to draw or the effects can't be made, so the caller draws the layer as it is; a failure is
+    /// logged, once for the same pixels and settings. Export uses `required` instead, which throws.
     static func cached(_ image: CGImage, mask: CGImage?, effects: LayerEffects?) -> (image: CGImage, inset: CGFloat)? {
+        do { return try required(image, mask: mask, effects: effects) } catch {
+            if let visible = effects?.visible, cache.firstReport(image: image, effects: visible) {
+                log.error("Layer effects left out of a \(image.width)×\(image.height) layer's composite: \(String(describing: error), privacy: .public)")
+            }
+            return nil
+        }
+    }
+
+    /// As `cached`, but throws when the effects can't be made rather than leaving them out.
+    static func required(_ image: CGImage, mask: CGImage?, effects: LayerEffects?) throws -> (image: CGImage, inset: CGFloat)? {
         guard let effects = effects?.visible, !effects.isEmpty, effects.isValid else { return nil }
-        return try? cache.result(image: image, mask: mask, effects: effects) {
+        return try cache.result(image: image, mask: mask, effects: effects) {
             try render(image, mask: mask, effects: effects)
         }
+    }
+
+    /// A result already made for these pixels, mask and settings, without making one. For composites drawn on the
+    /// main actor, which must not wait on a full-resolution render.
+    static func existing(_ image: CGImage, mask: CGImage?, effects: LayerEffects?) -> (image: CGImage, inset: CGFloat)? {
+        guard let effects = effects?.visible, !effects.isEmpty, effects.isValid else { return nil }
+        return cache.hit(image: image, mask: mask, effects: effects)
     }
 
     /// The layer's transform grown by the margin its effects need, so the bigger image lands in the same place.
@@ -438,7 +495,7 @@ nonisolated enum LayerEffectsRenderer {
         guard effects.isValid else { throw ProjectError.invalid }
         let inset = margin(for: effects)
         let width = image.width + Int(inset) * 2, height = image.height + Int(inset) * 2
-        guard width > 0, height > 0, width * height <= 100_000_000 else { throw ProjectError.tooLarge }
+        guard width > 0, height > 0, width * height <= 100_000_000 else { throw LayerEffectsError.tooLarge }
         let placed = CGRect(x: inset, y: inset, width: CGFloat(image.width), height: CGFloat(image.height))
         let full = CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height))
         // The layer as it is shown: its pixels through its mask.
@@ -447,8 +504,10 @@ nonisolated enum LayerEffectsRenderer {
             // The pixels with room around them, then the stroke and shadow drawn on the GPU.
             let padded = try BrushRaster.context(width: width, height: height, mask: false)
             BrushRaster.draw(shown, in: placed, mask: false, context: padded)
-            if let room = padded.makeImage(), let built = try? metal.render(room, effects: effects) {
-                return (built, inset)
+            if let room = padded.makeImage() {
+                do { return (try metal.render(room, effects: effects), inset) } catch {
+                    log.error("Layer effects fell back to the CPU: the GPU render failed (\(String(describing: error), privacy: .public))")
+                }
             }
         }
         let context = try BrushRaster.context(width: width, height: height, mask: false)
@@ -478,16 +537,17 @@ nonisolated enum LayerEffectsRenderer {
         context.draw(shown, in: CGRect(origin: .zero, size: placed.size))
         context.restoreGState()
         // Over the pixels: a flat color, then a shadow inside the layer's own edges.
-        if let overlay = effects.colorOverlay, overlay.isEnabled, overlay.opacity > 0,
-           let shape = try? coverage(shown, in: placed, size: CGSize(width: width, height: height), blur: 0) {
+        // A failure here throws like the rest, rather than quietly leaving one effect out.
+        if let overlay = effects.colorOverlay, overlay.isEnabled, overlay.opacity > 0 {
+            let shape = try coverage(shown, in: placed, size: CGSize(width: width, height: height), blur: 0)
             fill(overlay.color, alpha: overlay.opacity, coverage: shape, in: full, context: context)
         }
-        if let innerGlow = effects.innerGlow, innerGlow.isEnabled, innerGlow.opacity > 0,
-           let insideGlow = try? innerGlowCoverage(shown, placed: placed, size: CGSize(width: width, height: height), glow: innerGlow) {
+        if let innerGlow = effects.innerGlow, innerGlow.isEnabled, innerGlow.opacity > 0 {
+            let insideGlow = try innerGlowCoverage(shown, placed: placed, size: CGSize(width: width, height: height), glow: innerGlow)
             fill(innerGlow.color, alpha: innerGlow.opacity, coverage: insideGlow, in: full, context: context)
         }
-        if let inner = effects.innerShadow, inner.isEnabled, inner.opacity > 0,
-           let inside = try? innerCoverage(shown, placed: placed, size: CGSize(width: width, height: height), shadow: inner) {
+        if let inner = effects.innerShadow, inner.isEnabled, inner.opacity > 0 {
+            let inside = try innerCoverage(shown, placed: placed, size: CGSize(width: width, height: height), shadow: inner)
             fill(inner.color, alpha: inner.opacity, coverage: inside, in: full, context: context)
         }
         if let stroke, stroke.inside { try drawStroke(stroke) }

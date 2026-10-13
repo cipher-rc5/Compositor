@@ -114,6 +114,10 @@ struct CameraRawOpticsControls: View {
                 .buttonStyle(.borderless)
                 .tint(session.filterEdit?.samplesDefringe == true ? Color.accentColor : Color.secondary)
                 .help("Click a purple or green fringe to set its hue range.")
+                .accessibilityLabel("Defringe eyedropper")
+                .accessibilityValue(session.filterEdit?.samplesDefringe == true ? "On" : "Off")
+                .accessibilityHint("Then click a purple or green fringe on the layer to set its hue range.")
+                .accessibilityAddTraits(session.filterEdit?.samplesDefringe == true ? .isSelected : [])
             }
             if session.filterEdit?.samplesDefringe == true {
                 Text("Click the fringe on the layer. Click the eyedropper again to stop.")

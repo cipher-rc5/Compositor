@@ -369,23 +369,22 @@ struct SelectionEditTests {
         #expect(try pixel(masked, x: 100, y: 100)[3] == 0 && pixel(masked, x: 3000, y: 100)[3] == 255)
     }
 
+    /// Driven through the indicator's own task rather than timed with sleeps: the suite runs in parallel, so a
+    /// fixed window is flaky on a loaded machine.
     @Test func quickOperationsNeverDimTheInterface() async throws {
         let session = makeSession()
         session.isProjectBusy = true
-        try await Task.sleep(for: .milliseconds(60))
+        let quick = try #require(session.busyIndicatorTask)
+        // Finishing before the delay is up cancels the wait, so the short busy period never surfaces.
         session.isProjectBusy = false
+        #expect(session.busyIndicatorTask == nil)
+        await quick.value
         #expect(!session.showsBusy)
-        try await Task.sleep(for: .milliseconds(300))
-        #expect(!session.showsBusy) // The short busy period never surfaced.
-        // Long operations still dim. Polled rather than timed once: the suite runs in
-        // parallel, so a fixed window is flaky on a loaded machine.
+        // Long operations still dim: once the delay has run out, while still busy.
         session.isProjectBusy = true
-        var dimmed = false
-        for _ in 0..<40 where !dimmed {
-            try await Task.sleep(for: .milliseconds(50))
-            dimmed = session.showsBusy
-        }
-        #expect(dimmed)
+        let long = try #require(session.busyIndicatorTask)
+        await long.value
+        #expect(session.showsBusy)
         session.isProjectBusy = false
         #expect(!session.showsBusy)
     }

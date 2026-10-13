@@ -171,7 +171,7 @@ struct CameraRawTests {
         let neutral = try pixels(settings.apply(warm))[0]
         #expect(chroma(neutral) < chroma(before) / 2, "eyedropper pulls the cast in: \(before) → \(neutral)")
 
-        let auto = try #require(CameraRawSettings.autoBalance(of: warm))
+        let auto = try #require(try CameraRawSettings.autoBalance(of: warm))
         settings.temperature = auto.temperature
         settings.tint = auto.tint
         let averaged = try pixels(settings.apply(warm))[0]
@@ -643,6 +643,98 @@ struct CameraRawTests {
         #expect(coolGuided != coolPixels)
         #expect(warmGuided != warmPixels)
         #expect(coolGuided != warmGuided)
+    }
+
+    /// Scale at its minimum shrinks the picture to half its size, centered, and never to the point at its center.
+    @Test func geometryScaleAtItsMinimumHalvesThePicture() throws {
+        #expect(CameraRawGeometrySettings.zoom(forScale: -100) == 0.5)
+        #expect(CameraRawGeometrySettings.zoom(forScale: 0) == 1 && CameraRawGeometrySettings.zoom(forScale: 100) == 2)
+        #expect(stride(from: -100.0, through: 100, by: 5).allSatisfy { CameraRawGeometrySettings.zoom(forScale: $0) > 0 })
+        let red = try image(width: 40, height: 40, red: 1, green: 0, blue: 0)
+        var settings = CameraRawSettings()
+        settings.geometry.scale = -100
+        let shrunk = try pixels(settings.apply(red))
+        func at(_ x: Int, _ y: Int) -> [Int] { shrunk[y * 40 + x] }
+        #expect(at(20, 20) == [255, 0, 0, 255] && at(12, 12) == [255, 0, 0, 255] && at(27, 27) == [255, 0, 0, 255],
+                "the middle half is the picture")
+        #expect(at(2, 2)[3] == 0 && at(37, 20)[3] == 0 && at(20, 5)[3] == 0, "the rest is empty")
+    }
+
+    /// Auto white balance adds up a copy no larger than `autoBalanceLimit` in C, exactly as the Swift loop it replaced
+    /// added up every pixel: same order, same decoding, the same bits.
+    @Test func autoBalanceAveragesInCAsTheSwiftLoopDid() throws {
+        func reference(_ image: CGImage) throws -> (Double, Double, Double)? {
+            func decode(_ encoded: Double) -> Double { encoded <= 0.04045 ? encoded / 12.92 : pow((encoded + 0.055) / 1.055, 2.4) }
+            let context = try BrushRaster.context(width: image.width, height: image.height, mask: false)
+            BrushRaster.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height), mask: false, context: context)
+            let bytes = try #require(context.data).assumingMemoryBound(to: UInt8.self)
+            var red = 0.0, green = 0.0, blue = 0.0, count = 0.0
+            for y in 0..<image.height { for x in 0..<image.width {
+                let pixel = y * context.bytesPerRow + x * 4, alpha = Double(bytes[pixel + 3])
+                if alpha == 0 { continue }
+                red += decode(min(1, Double(bytes[pixel]) / alpha))
+                green += decode(min(1, Double(bytes[pixel + 1]) / alpha))
+                blue += decode(min(1, Double(bytes[pixel + 2]) / alpha))
+                count += 1
+            } }
+            return count > 0 ? (red / count, green / count, blue / count) : nil
+        }
+        let context = try BrushRaster.context(width: 37, height: 23, mask: false)
+        for y in 0..<23 { for x in 0..<37 {
+            context.setFillColor(CGColor(srgbRed: CGFloat(x) / 36, green: CGFloat(y) / 22, blue: CGFloat((x * y) % 11) / 10,
+                                         alpha: (x + y) % 5 == 0 ? 0 : (x % 3 == 0 ? 0.5 : 1)))
+            context.fill(CGRect(x: x, y: y, width: 1, height: 1))
+        } }
+        let image = try #require(context.makeImage())
+        let made = try #require(try CameraRawSettings.averageLinear(image))
+        let expected = try #require(try reference(image))
+        #expect(made.red == expected.0 && made.green == expected.1 && made.blue == expected.2)
+        #expect(try CameraRawSettings.averageLinear(self.image(red: 1, green: 0, blue: 0, alpha: 0)) == nil)
+
+        // A large layer is read from a copy: a flat color averages to itself all the same.
+        let wide = try self.image(width: 3000, height: 40, red: 0.6, green: 0.4, blue: 0.3)
+        let flat = try #require(try CameraRawSettings.averageLinear(wide))
+        let small = try #require(try reference(self.image(width: 1, height: 1, red: 0.6, green: 0.4, blue: 0.3)))
+        #expect(abs(flat.red - small.0) < 1e-12 && abs(flat.green - small.1) < 1e-12 && abs(flat.blue - small.2) < 1e-12)
+    }
+
+    /// Closing the panel stops Auto's scan, and a scan that finishes after it leaves the panel and its sliders alone.
+    @Test func autoWhiteBalanceStopsWithItsPanel() async throws {
+        let warm = try image(width: 8, height: 8, red: 160 / 255, green: 140 / 255, blue: 120 / 255)
+        let session = EditorSession()
+        session.createDocument(width: 8, height: 8)
+        session.insert(ImportedImage(image: warm, thumbnail: warm, name: "Warm"))
+        session.beginFilter(.cameraRaw)
+        let edit = try #require(session.filterEdit)
+        let scan = Task { await session.applyCameraRawAutoWhiteBalance() }
+        await Task.yield()
+        let task = edit.whiteBalanceTask
+        session.cancelFilter()
+        #expect(task == nil || task?.isCancelled == true, "the scan was cancelled with the panel")
+        await scan.value
+        #expect(session.filterEdit == nil && session.brushError == nil)
+        #expect(edit.settings.cameraRaw.temperature == 0 && edit.settings.cameraRaw.tint == 0, "nothing landed after the panel closed")
+    }
+
+    /// A layer past the preview limit opens Camera Raw at once; the first preview makes the smaller copy previews read.
+    @Test func aLargeLayerIsCopiedForPreviewsWithTheFirstPreview() async throws {
+        let wide = try image(width: Int(FilterEdit.previewLimit) + 300, height: 4, red: 0.5, green: 0.5, blue: 0.5)
+        let session = EditorSession()
+        session.createDocument(width: 400, height: 4)
+        session.insert(ImportedImage(image: wide, thumbnail: wide, name: "Wide"))
+        session.beginFilter(.cameraRaw)
+        let edit = try #require(session.filterEdit)
+        #expect(edit.previewSource === wide && edit.previewScale == 1, "nothing was drawn while the panel opened")
+        var settings = edit.settings
+        settings.cameraRaw.exposure = 1
+        session.updateFilter(settings, preview: true)
+        while let task = edit.previewTask { await task.value }
+        #expect(edit.previewSource.width == Int(FilterEdit.previewLimit))
+        #expect(abs(edit.previewScale - FilterEdit.previewLimit / CGFloat(wide.width)) < 1e-9)
+        let preview = try #require(edit.previewImage(for: edit.layerID))
+        #expect(preview.width == edit.previewSource.width && edit.previewError == nil)
+        #expect(try pixels(preview)[0][0] > 160, "mid gray brightened by a stop")
+        session.cancelFilter()
     }
 
     private func peakIndex(_ bins: [Double]) -> Int {

@@ -53,17 +53,61 @@ struct LayerTests {
         #expect(session.activeLayer?.isVisible == true)
     }
 
-    @Test func reorderTranslatesVisibleOrderAndKeepsSelection() throws {
+    @Test func reorderKeepsSelection() throws {
         let session = sessionWithThreeLayers()
-        let active = session.activeLayerID
-        session.reorderLayers(from: IndexSet(integer: 0), to: 3)
+        let active = try #require(session.activeLayerID)
+        #expect(session.placeLayer(active, in: nil, atBottom: true))
         #expect(session.document?.layers.map(\.name) == ["Layer 3", "Layer 1", "Layer 2"])
         #expect(session.activeLayerID == active)
         #expect(!session.canMoveActiveLayer(by: -1))
         session.moveActiveLayer(by: 1)
         #expect(session.document?.layers.map(\.name) == ["Layer 1", "Layer 3", "Layer 2"])
-        session.reorderLayers(from: IndexSet(integer: 99), to: 0)
+        #expect(!session.placeLayer(UUID(), in: nil))
         #expect(session.document?.layers.count == 3)
+    }
+
+    /// Move Layer Up/Down (⌘] and ⌘[) treat clipping as a drag does: below its base a layer stops clipping, and moved
+    /// back up between the base and a clipped layer it joins the stack.
+    @Test func menuMovesReleaseAndAdoptClippingLikeADrag() throws {
+        let session = EditorSession()
+        session.createDocument(width: 2, height: 2)
+        for _ in 0..<3 { session.insert(try LiveMaskTests().asset([255, 255, 255, 255])) }
+        let ids = try #require(session.document?.layers.map(\.id))
+        session.toggleClippingMask(ids[1])
+        session.toggleClippingMask(ids[2])
+        #expect(session.document?.layers.map(\.maskSourceID) == [nil, ids[0], ids[0]])
+
+        // The middle clipped layer moved below its base no longer clips; the one above it loses its base too.
+        session.activeLayerID = ids[1]
+        session.moveActiveLayer(by: -1)
+        #expect(session.document?.layers.map(\.id) == [ids[1], ids[0], ids[2]])
+        #expect(session.document?.layers.first?.maskSourceID == nil)
+        #expect(session.document?.layers.last?.maskSourceID == ids[0])
+
+        // Undo puts the clipping back as it was, in one step.
+        session.undo()
+        #expect(session.document?.layers.map(\.maskSourceID) == [nil, ids[0], ids[0]])
+
+        // An unclipped layer moved down between the base and a clipped layer joins the stack.
+        session.activeLayerID = ids[2]
+        session.toggleClippingMask(ids[2])
+        #expect(session.document?.layers.last?.maskSourceID == nil)
+        session.moveActiveLayer(by: -1)
+        #expect(session.document?.layers.map(\.id) == [ids[0], ids[2], ids[1]])
+        #expect(session.document?.layers[1].maskSourceID == ids[0])
+    }
+
+    @Test func newLayerAndFolderNamesSkipTheOnesInUse() throws {
+        let session = sessionWithThreeLayers()
+        #expect(session.document?.unusedName("Layer") == "Layer 4")
+        #expect(session.nextLayerName() == "Layer 4")
+        session.renameLayer(try #require(session.document?.layers[1].id), to: "Sky")
+        #expect(session.document?.unusedName("Layer") == "Layer 2")
+        session.addBlankLayer()
+        #expect(session.activeLayer?.name == "Layer 2")
+        session.addGroup()
+        #expect(session.activeLayer?.name == "Folder 1")
+        #expect(session.document?.unusedName("Folder") == "Folder 2")
     }
 
     @Test func unavailableActionsDoNotChangeDocument() {

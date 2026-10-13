@@ -5,7 +5,7 @@ import CoreImage
 /// Whole-image invert in one vectorized pass (vImage), optionally limited to a selection.
 /// Inverting never changes a layer's size, so no tiles, bounds scans, or re-cropping.
 nonisolated enum PixelInvert {
-    struct Job: @unchecked Sendable {
+    struct Job: Sendable {
         let image: CGImage
         let isMask: Bool
         /// Maps the image's top-left pixel grid to document pixels.

@@ -107,3 +107,50 @@ struct GroupTests {
         #expect(throws: ProjectError.self) { try LayerHierarchy.validate([rasterParent, nested]) }
     }
 }
+
+@MainActor
+struct PhotoshopInsertNestingTests {
+    /// A document whose active layer is a folder 62 folders deep: the import's wrapping folder lands at the deepest
+    /// level a folder may sit at, so only plain layers fit inside it.
+    private func deepSession() throws -> EditorSession {
+        let session = EditorSession()
+        session.createDocument(width: 10, height: 10)
+        var folders: [ImageLayer] = []
+        for index in 0..<63 {
+            var folder = ImageLayer(name: "Folder \(index)", blankSize: CGSize(width: 10, height: 10))
+            folder.isGroup = true
+            folder.parentID = folders.last?.id
+            folders.append(folder)
+        }
+        session.document?.layers = folders
+        session.selectLayer(try #require(folders.last).id)
+        return session
+    }
+
+    private func layer(_ name: String, group: Bool = false, parent: UUID? = nil) -> ImageLayer {
+        var layer = ImageLayer(name: name, blankSize: CGSize(width: 10, height: 10))
+        layer.isGroup = group
+        layer.parentID = parent
+        return layer
+    }
+
+    @Test func aFolderThatWouldNestPast64IsRefused() throws {
+        let session = try deepSession()
+        let folder = layer("Imported folder", group: true)
+        let imported = PSDImport(width: 10, height: 10, resolution: 72,
+                                 layers: [folder, layer("Inside", parent: folder.id)], conversions: [])
+        #expect(throws: ImageImportError.tooDeep) {
+            try session.insertPhotoshop(imported, named: "Deep")
+        }
+        #expect(session.document?.layers.count == 63)
+    }
+
+    @Test func plainLayersStillFitAtTheDeepestLevel() throws {
+        let session = try deepSession()
+        let imported = PSDImport(width: 10, height: 10, resolution: 72, layers: [layer("Flat")], conversions: [])
+        try session.insertPhotoshop(imported, named: "Deep")
+        let layers = try #require(session.document?.layers)
+        #expect(layers.count == 65)
+        #expect(EditorSession.nestingFits(layers))
+    }
+}

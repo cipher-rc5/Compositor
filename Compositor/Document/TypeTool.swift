@@ -38,7 +38,7 @@ nonisolated struct LayerTextStyle: Codable, Equatable, Sendable {
 
 /// The cached raster participates in the existing compositor. Pixel edits rasterize the layer;
 /// transforms and masks keep the source text editable, just as shape layers keep their source.
-nonisolated struct LayerText: Equatable, @unchecked Sendable {
+nonisolated struct LayerText: Equatable, Sendable {
     var style: LayerTextStyle
     let image: CGImage
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.style == rhs.style && lhs.image === rhs.image }
@@ -131,8 +131,10 @@ extension EditorSession {
                 document?.layers[index].transform = transform
                 endEdit()
             } else {
-                addPixelLayer(image, at: draft.origin, name: Self.layerName(for: draft.style.content), editName: "New Text Layer",
-                              dropsSelection: false, text: text)
+                // Refused, the draft stays open (see `succeeded`), so what was typed isn't lost.
+                guard fitsPixelBudget(adding: image.width * image.height, action: "The new text layer"),
+                      addPixelLayer(image, at: draft.origin, name: Self.layerName(for: draft.style.content), editName: "New Text Layer",
+                                    dropsSelection: false, text: text) else { return false }
             }
             succeeded = true
             textDefaults = draft.style
@@ -208,11 +210,10 @@ extension EditorSession {
         let font = NSFont(name: style.fontName, size: style.fontSize) ?? NSFont.systemFont(ofSize: style.fontSize)
         // Leading is the line's whole height, so the lines close up (and eventually overlap) as it comes down,
         // exactly as Photoshop's does. Auto is 120% of the size.
-        _ = font
         paragraph.minimumLineHeight = style.lineHeight
         paragraph.maximumLineHeight = style.lineHeight
         paragraph.lineBreakMode = .byWordWrapping
-        return [.font: NSFont(name: style.fontName, size: style.fontSize) ?? NSFont.systemFont(ofSize: style.fontSize),
+        return [.font: font,
                 .foregroundColor: NSColor(srgbRed: style.red, green: style.green, blue: style.blue, alpha: 1),
                 .paragraphStyle: paragraph, .kern: style.tracking]
     }

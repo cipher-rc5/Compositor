@@ -97,29 +97,32 @@ nonisolated struct CameraRawOpticsSettings: Equatable, Sendable {
 
 nonisolated extension CameraRawSettings {
     func applyDetailOptics(pixels: UnsafeMutablePointer<UInt8>, width: Int, height: Int, stride: Int, scale: Double,
-                           profileStrength: Double, sharpenMask: Bool) {
+                           profileStrength: Double, sharpenMask: Bool) throws {
         let detail = detail.normalized
         let optics = optics.normalized
         if sharpenMask {
-            adjust_camera_raw_sharpen_mask_overlay(pixels, width, height, stride,
-                                                     detail.sharpenRadius, detail.sharpenDetail, detail.sharpenMasking, scale)
+            let status = adjust_camera_raw_sharpen_mask_overlay(pixels, width, height, stride,
+                                                                detail.sharpenRadius, detail.sharpenDetail, detail.sharpenMasking, scale)
+            try ImageAdjustmentPixels.check(status)
             return
         }
         if optics.adjusts {
-            adjust_camera_raw_optics(pixels, width, height, stride,
-                                     optics.removeChromaticAberration ? 1 : 0,
-                                     optics.enableLensProfile ? 1 : 0,
-                                     optics.profileDistortion, optics.profileVignetting,
-                                     optics.distortionK(profileStrength: profileStrength),
-                                     optics.purpleAmount, optics.purpleHueLow, optics.purpleHueHigh,
-                                     optics.greenAmount, optics.greenHueLow, optics.greenHueHigh,
-                                     optics.vignetteAmount, optics.vignetteMidpoint, scale)
+            let status = adjust_camera_raw_optics(pixels, width, height, stride,
+                                                  optics.removeChromaticAberration ? 1 : 0,
+                                                  optics.enableLensProfile ? 1 : 0,
+                                                  optics.profileDistortion, optics.profileVignetting,
+                                                  optics.distortionK(profileStrength: profileStrength),
+                                                  optics.purpleAmount, optics.purpleHueLow, optics.purpleHueHigh,
+                                                  optics.greenAmount, optics.greenHueLow, optics.greenHueHigh,
+                                                  optics.vignetteAmount, optics.vignetteMidpoint, scale)
+            try ImageAdjustmentPixels.check(status)
         }
         if detail.adjusts {
-            adjust_camera_raw_detail(pixels, width, height, stride,
-                                     detail.sharpenAmount, detail.sharpenRadius, detail.sharpenDetail, detail.sharpenMasking,
-                                     detail.noiseLuminance, detail.noiseLuminanceDetail, detail.noiseLuminanceContrast,
-                                     detail.noiseColor, detail.noiseColorDetail, detail.noiseColorSmoothness, scale)
+            let status = adjust_camera_raw_detail(pixels, width, height, stride,
+                                                  detail.sharpenAmount, detail.sharpenRadius, detail.sharpenDetail, detail.sharpenMasking,
+                                                  detail.noiseLuminance, detail.noiseLuminanceDetail, detail.noiseLuminanceContrast,
+                                                  detail.noiseColor, detail.noiseColorDetail, detail.noiseColorSmoothness, scale)
+            try ImageAdjustmentPixels.check(status)
         }
     }
 }

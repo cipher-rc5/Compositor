@@ -129,6 +129,54 @@ struct HueSaturationTests {
         #expect(near(try await pixel(session, x: 5, y: 5), [0, 255, 0, 255]))
     }
 
+    /// Cancel leaves its render running in the background. Reopening and moving a slider straight away used to wait on
+    /// that cancelled render, which then found its panel gone and returned without starting the new one: the canvas
+    /// showed the plain layer until the next slider change.
+    @Test func reopeningRightAfterCancelPreviewsTheFirstChange() async throws {
+        let session = try makeSession()
+        session.beginHueSaturation()
+        session.updateHueSaturation(HueSaturationSettings(hue: 120), preview: true)
+        let abandoned = try #require(session.hueSaturationTask)
+        session.cancelHueSaturation()
+        session.beginHueSaturation()
+        session.updateHueSaturation(HueSaturationSettings(hue: 120), preview: true)
+        let edit = try #require(session.hueSaturation)
+        await abandoned.value
+        await session.hueSaturationTask?.value
+        #expect(edit.previewImage(for: edit.layerID) != nil, "the reopened panel's first change is previewed")
+        #expect(near(try previewPixel(edit, x: 5, y: 5), [0, 255, 0, 255]))
+        session.cancelHueSaturation()
+    }
+
+    /// A render cancelled after it started must not put its picture back once the preview has been cleared.
+    @Test func aCancelledRenderNeverRepaintsAClearedPreview() async throws {
+        let session = try makeSession()
+        session.beginHueSaturation()
+        session.updateHueSaturation(HueSaturationSettings(hue: 120), preview: true)
+        let running = try #require(session.hueSaturationTask)
+        session.updateHueSaturation(HueSaturationSettings(), preview: true)
+        await running.value
+        let edit = try #require(session.hueSaturation)
+        #expect(edit.previewImage(for: edit.layerID) == nil)
+        session.cancelHueSaturation()
+    }
+
+    /// OK whose layer changed while it rendered is dropped, and says so rather than closing as if it had applied.
+    @Test func applyDroppedForAChangedLayerIsReported() async throws {
+        let session = try makeSession()
+        session.beginHueSaturation()
+        session.updateHueSaturation(HueSaturationSettings(hue: 120), preview: true)
+        let commit = Task { await session.commitHueSaturation() }
+        await Task.yield()
+        let replacement = try BrushRaster.context(width: 40, height: 20, mask: false).makeImage()
+        let image = try #require(replacement)
+        session.document?.layers[0].asset = ImportedImage(image: image, thumbnail: image, name: "Replaced")
+        await commit.value
+        #expect(session.hueSaturation == nil)
+        #expect(session.document?.layers[0].asset?.image === image, "the newer pixels stay")
+        #expect(session.brushError?.contains("Hue/Saturation") == true)
+    }
+
     /// A pixel of the live preview image, which may be smaller than the layer.
     private func previewPixel(_ edit: HueSaturationEdit, x: Int, y: Int) throws -> [Int] {
         let image = try #require(edit.previewImage(for: edit.layerID))
@@ -269,5 +317,68 @@ struct HueSaturationTests {
         gray.hueSampleMode = .replace
         gray.sampleHueRange(at: CGPoint(x: 30, y: 5))
         #expect(gray.hueSaturation?.settings.band == before)
+    }
+
+    /// Hue/Saturation opened over a gradient still being placed: the gradient goes onto the layer first and the panel
+    /// adjusts that, as Levels does. Reading the layer before the gradient landed made OK drop the adjustment.
+    @Test func waitsForAPendingGradientAndAdjustsIt() async throws {
+        let session = try makeSession()
+        session.selectTool(.gradient)
+        session.gradientSettings.style = .foregroundToBackground
+        session.beginGradient(at: CGPoint(x: 0.5, y: 2))
+        session.moveGradient(end: CGPoint(x: 39.5, y: 2))
+        session.endGradientDrag()
+        #expect(session.gradientEdit != nil)
+        let count = session.history.undoCount
+        session.beginHueSaturation()
+        for _ in 0..<500 where session.hueSaturation == nil { try await Task.sleep(for: .milliseconds(5)) }
+        let edit = try #require(session.hueSaturation)
+        #expect(session.gradientEdit == nil && session.history.undoCount == count + 1, "the gradient was committed first")
+        #expect(edit.original.image === session.activeLayer?.asset?.image, "the panel reads the layer with the gradient on it")
+        let gradient = try await pixel(session, x: 39, y: 5)
+        session.updateHueSaturation(HueSaturationSettings(lightness: -100), preview: true)
+        await session.commitHueSaturation()
+        #expect(session.brushError == nil, "nothing was dropped: \(session.brushError ?? "")")
+        #expect(session.history.undoCount == count + 2 && session.history.undoName == "Hue/Saturation")
+        #expect(gradient[0] > 128, "the far end of the gradient is light: \(gradient)")
+        #expect(near(try await pixel(session, x: 39, y: 5), [0, 0, 0, 255]), "and the adjustment darkened it")
+    }
+
+    /// Colorize wraps a negative hue round the wheel: −60° is magenta (300°), not the red a negative sector gave.
+    @Test func colorizeWrapsANegativeHue() {
+        let negative = HueSaturationSettings(hue: -60, saturation: 100, colorize: true)
+        let wrapped = HueSaturationSettings(hue: 300, saturation: 100, colorize: true)
+        let color = HueSaturationFilter.adjust(red: 0.5, green: 0.5, blue: 0.5, settings: negative)
+        let expected = HueSaturationFilter.adjust(red: 0.5, green: 0.5, blue: 0.5, settings: wrapped)
+        #expect(abs(color.red - expected.red) < 1e-12 && abs(color.green - expected.green) < 1e-12
+                && abs(color.blue - expected.blue) < 1e-12)
+        #expect(color.red > 0.9 && color.blue > 0.9 && color.green < 0.1, "magenta: \(color)")
+        let past = HueSaturationFilter.adjust(red: 0.5, green: 0.5, blue: 0.5,
+                                              settings: HueSaturationSettings(hue: -420, saturation: 100, colorize: true))
+        #expect(abs(past.red - expected.red) < 1e-12 && abs(past.blue - expected.blue) < 1e-12, "a full turn further back too")
+    }
+
+    /// A layer past the preview limit opens the panel at once, reading the layer itself, and the smaller copy its
+    /// previews read is made off the main actor; previews wait for it rather than render at full size.
+    @Test func aLargeLayerIsCopiedForPreviewsInTheBackground() async throws {
+        let session = EditorSession()
+        session.createDocument(width: 400, height: 2)
+        let context = try BrushRaster.context(width: HueSaturationEdit.previewLimit + 400, height: 2, mask: false)
+        context.setFillColor(CGColor(srgbRed: 1, green: 0, blue: 0, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: HueSaturationEdit.previewLimit + 400, height: 2))
+        let image = try #require(context.makeImage())
+        session.insert(ImportedImage(image: image, thumbnail: image, name: "Wide"))
+        session.beginHueSaturation()
+        let edit = try #require(session.hueSaturation)
+        #expect(edit.previewSource === image, "nothing was drawn while the panel opened")
+        let setup = try #require(edit.setupTask)
+        session.updateHueSaturation(HueSaturationSettings(hue: 120), preview: true)
+        #expect(session.hueSaturationTask == nil, "the preview waits for the copy")
+        await setup.value
+        #expect(edit.previewSource.width == HueSaturationEdit.previewLimit && edit.setupTask == nil)
+        await session.hueSaturationTask?.value
+        let preview = try #require(edit.previewImage(for: edit.layerID))
+        #expect(preview.width == HueSaturationEdit.previewLimit, "the preview was made from the copy")
+        session.cancelHueSaturation()
     }
 }

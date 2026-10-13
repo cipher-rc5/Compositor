@@ -22,7 +22,8 @@ struct LevelsSheet: View {
             VStack(spacing: 0) {
                 histogram.frame(height: 150).background(.black.opacity(0.25))
                     .overlay(alignment: .topLeading) {
-                        if edit?.histogramReady != true { Text("Loading histogram…").font(.caption).padding(8) }
+                        if let error = edit?.histogramError { Text(error).font(.caption).foregroundStyle(.orange).padding(8) }
+                        else if edit?.histogramReady != true { Text("Loading histogram…").font(.caption).padding(8) }
                     }
                 handles(output: false).frame(height: 20)
             }
@@ -71,6 +72,9 @@ struct LevelsSheet: View {
                 })).configuredNativeShortcut("p", modifiers: .option)
                 Spacer()
                 Button("Reset") { edit?.sampleMode = nil; update { $0 = LevelsSettings() } }
+            }
+            if let error = edit?.previewError {
+                Text(error).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
             }
             Text(session.adjustmentOriginal != nil ? "Underlying pixels · alpha-weighted histogram" : session.selection == nil ? "Original pixels · alpha-weighted histogram" : "Original pixels · selection and alpha-weighted histogram")
                 .font(.caption).foregroundStyle(.secondary)

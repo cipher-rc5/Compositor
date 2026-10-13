@@ -34,9 +34,22 @@ extension EditorSession {
         let before = document, beforeActive = activeLayerID
         // Outer edit: closed by commitTransform (merge) or cancelTransform (restore).
         beginEdit("Transform Selection")
-        await clearSelectedPixels()
-        guard let index = self.document?.layers.firstIndex(where: { $0.id == source.id }),
-              let thumbnail = try? PixelInvert.thumbnail(of: lifted.image) else {
+        // The pixels move only if they leave their place: when the clear fails, floating them anyway would make the
+        // transform a copy. It reports its own error; the float is abandoned.
+        guard await clearSelectedPixels() else {
+            self.document = before
+            endEdit()
+            if brushError == nil { brushError = "The selected pixels couldn’t be lifted to transform them." }
+            return
+        }
+        let thumbnail: CGImage
+        do { thumbnail = try PixelInvert.thumbnail(of: lifted.image) } catch {
+            self.document = before
+            endEdit()
+            brushError = error.localizedDescription
+            return
+        }
+        guard let index = self.document?.layers.firstIndex(where: { $0.id == source.id }) else {
             self.document = before
             endEdit()
             return
@@ -64,19 +77,18 @@ extension EditorSession {
     }
 
     /// Composites the transformed pixels back into their layer, moves the selection with
-    /// them, and closes the undo step. Synchronous so tool/layer switches and Save can call it.
+    /// them, and closes the undo step. Synchronous so the many edits that commit a pending transform before acting
+    /// can call it and go on at once; Apply, Save, Merge and tool switches render it off the main thread first
+    /// (`applyTransform`), and this then uses what they made.
     func mergeFloatingTransform(_ edit: TransformEdit, _ floating: FloatingTransform) {
         defer { endEdit() }
         do {
             guard edit.draft.isValid, let layers = document?.layers,
                   let pixels = layers.first(where: { $0.id == edit.layerID })?.asset?.image,
                   let source = layers.first(where: { $0.id == floating.sourceID }) else { throw ProjectError.invalid }
-            // A distorted selection is warped into its new shape first, then merged like any other.
-            let placed = try edit.corners.map { corners -> (image: CGImage, transform: LayerTransform) in
-                let warped = try DistortWarp.warpTrimmed(pixels, transform: edit.draft, corners: corners)
-                return (warped.image, warped.transform)
-            } ?? (image: pixels, transform: edit.draft)
-            let merged = try FloatingMerge.merge(placed.image, transform: placed.transform, into: source)
+            let job = FloatingMerge.Job(pixels: pixels, draft: edit.draft, corners: edit.corners, source: source)
+            let ready = FloatingMerge.rendered.flatMap { $0.matches(job) ? $0.merged : nil }
+            let merged = try ready ?? FloatingMerge.render(job)
             let moved: DocumentSelection?
             if let corners = edit.corners {
                 let placement = BrushRaster.pixelToDocument(floating.original, width: Int(floating.pixelSize.width),
@@ -95,9 +107,7 @@ extension EditorSession {
             }
             document?.layers.removeAll { $0.id == edit.layerID }
             guard let index = document?.layers.firstIndex(where: { $0.id == source.id }) else { throw ProjectError.invalid }
-            document?.layers[index] = ImageLayer(id: source.id, asset: merged.asset, name: source.name, isVisible: source.isVisible,
-                transform: merged.transform, parentID: source.parentID, isGroup: false,
-                opacity: source.opacity, blendMode: source.blendMode, mask: merged.mask, maskSourceID: source.maskSourceID)
+            document?.layers[index] = source.replacingPixels(merged.asset, transform: merged.transform, mask: merged.mask)
             document?.selection = moved
             activeLayerID = source.id
         } catch {
@@ -105,6 +115,41 @@ extension EditorSession {
             activeLayerID = floating.beforeActive
             brushError = error.localizedDescription
         }
+    }
+
+    /// Whether committing the pending transform resamples pixels — a floating selection that moved, or a distortion —
+    /// which is worth doing off the main thread first (`applyTransform`).
+    var pendingTransformResamples: Bool {
+        guard let edit = transformEdit else { return false }
+        if let floating = edit.floating { return edit.draft != floating.original || edit.corners != nil }
+        return edit.corners != nil && !edit.mask
+    }
+
+    /// Apply for a floating selection: the warp and merge are made off the main thread while the preview stays up and
+    /// other edits wait, then committed like any transform.
+    func applyFloatingTransform(_ edit: TransformEdit, _ floating: FloatingTransform) async {
+        guard edit.draft != floating.original || edit.corners != nil, edit.draft.isValid, let layers = document?.layers,
+              let pixels = layers.first(where: { $0.id == edit.layerID })?.asset?.image,
+              let source = layers.first(where: { $0.id == floating.sourceID }) else {
+            // Nothing to render, or nothing it could be rendered from: the commit restores or reports.
+            commitTransform()
+            return
+        }
+        let job = FloatingMerge.Job(pixels: pixels, draft: edit.draft, corners: edit.corners, source: source)
+        isProjectBusy = true
+        let rendered = await Task.detached(priority: .userInitiated) { () -> FloatingMerge.Rendered? in
+            // A failure is left for the commit to meet again and report.
+            guard let merged = try? FloatingMerge.render(job) else { return nil }
+            return FloatingMerge.Rendered(job: job, merged: merged)
+        }.value
+        isProjectBusy = false
+        // Cancelled meanwhile, or another edit: there is nothing of this one left to apply.
+        guard let pending = transformEdit, pending.layerID == edit.layerID, pending.floating != nil else {
+            ToolLog.staleResult("Transform Selection")
+            return
+        }
+        // Whatever no longer matches (the handles nudged meanwhile) is redone by the commit itself.
+        FloatingMerge.$rendered.withValue(rendered) { commitTransform() }
     }
 
     func cancelFloatingTransform(_ floating: FloatingTransform) {
@@ -115,6 +160,34 @@ extension EditorSession {
 }
 
 nonisolated enum FloatingMerge {
+    /// What a floating selection's merge is made from: its pixels and where they now go, and the layer they go into.
+    struct Job: Sendable {
+        let pixels: CGImage
+        let draft: LayerTransform
+        let corners: [CGPoint]?
+        let source: ImageLayer
+    }
+    typealias Merged = (asset: ImportedImage, transform: LayerTransform, mask: LayerMask?)
+
+    /// A merge made off the main thread for the Apply in progress (see `applyTransform`), with what it was made from.
+    struct Rendered: Sendable {
+        let job: Job
+        let merged: Merged
+        func matches(_ other: Job) -> Bool {
+            job.pixels === other.pixels && job.draft == other.draft && job.corners == other.corners && job.source == other.source
+        }
+    }
+    @TaskLocal static var rendered: Rendered?
+
+    /// The merge, start to finish: a distorted selection is warped into its new shape first, then merged like any other.
+    static func render(_ job: Job) throws -> Merged {
+        let placed = try job.corners.map { corners -> (image: CGImage, transform: LayerTransform) in
+            let warped = try DistortWarp.warpTrimmed(job.pixels, transform: job.draft, corners: corners)
+            return (warped.image, warped.transform)
+        } ?? (image: job.pixels, transform: job.draft)
+        return try merge(placed.image, transform: placed.transform, into: job.source)
+    }
+
     /// Draws the floating pixels (with their transform) onto the source layer's own pixel
     /// grid, growing the layer where they now extend past it. A mask grows with it, revealing
     /// the new area.

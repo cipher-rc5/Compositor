@@ -44,14 +44,17 @@ struct LayersPanel: View {
                     }
                 } label: { Image(systemName: "sparkles").footerHitArea() }
                     .menuStyle(.borderlessButton).fixedSize()
-                    .help("Layer effects: stroke and drop shadow").accessibilityLabel("Layer effects")
+                    .help("Layer effects: " + ListFormatter.localizedString(byJoining: LayerEffectKind.allCases.map(\.rawValue)).lowercased())
+                    .accessibilityLabel("Layer effects")
                     .accessibilityIdentifier("layerEffects").disabled(!session.canEditEffects)
                 Menu {
                     ForEach(AdjustmentKind.allCases, id: \.self) { kind in
                         Button(kind.rawValue) { session.addAdjustment(kind) }
                     }
                 } label: { Image(systemName: "circle.lefthalf.filled").footerHitArea() }
-                    .menuStyle(.borderlessButton).fixedSize().help("New adjustment layer").disabled(!session.canEditLayers)
+                    .menuStyle(.borderlessButton).fixedSize().help("New adjustment layer")
+                    .accessibilityLabel("New adjustment layer").accessibilityIdentifier("addAdjustmentLayer")
+                    .disabled(!session.canEditLayers)
                 Spacer()
                 Button { session.deleteLayerOrMask() } label: { Image(systemName: "trash").footerHitArea() }
                     .help(session.selectedEffect != nil ? "Delete selected effect" : session.isMaskSelected ? "Delete layer mask" : session.selectedLayerIDs.count > 1 ? "Delete selected layers" : "Delete selected layer")

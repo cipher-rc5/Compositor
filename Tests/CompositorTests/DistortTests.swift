@@ -95,4 +95,50 @@ struct DistortTests {
         let bytes = try #require(read.data).assumingMemoryBound(to: UInt8.self)
         #expect(bytes[(20 * result.width + 30) * 4 + 3] == 255) // the square stays where the warp put it
     }
+
+    /// Apply renders the distortion off the main thread, keeping the preview up and edits waiting, then commits it
+    /// exactly as an immediate commit would.
+    @Test func applyRendersOffTheMainThreadAndMatchesAnImmediateCommit() async throws {
+        func distorted(applying: Bool) async throws -> (ImageLayer, undoCount: Int, undoName: String) {
+            let session = EditorSession()
+            session.createDocument(width: 100, height: 60)
+            let context = try BrushRaster.context(width: 20, height: 20, mask: false)
+            context.setFillColor(CGColor(srgbRed: 1, green: 0.5, blue: 0, alpha: 1))
+            context.fill(CGRect(x: 2, y: 2, width: 16, height: 14))
+            let image = try #require(context.makeImage())
+            session.insert(ImportedImage(image: image, thumbnail: image, name: "Orange"))
+            let index = try #require(session.document?.layers.firstIndex { $0.id == session.activeLayerID })
+            session.document?.layers[index].transform = LayerTransform(origin: CGPoint(x: 10, y: 10), size: CGSize(width: 20, height: 20))
+            session.selectTool(.move)
+            session.beginTransform(persistent: false)
+            session.beginDistort()
+            session.previewCorners(shape)
+            let count = session.history.undoCount
+            if applying { await session.applyTransform() } else { session.commitTransform() }
+            #expect(session.transformEdit == nil && !session.isProjectBusy && session.history.undoCount == count + 1)
+            return (try #require(session.activeLayer), session.history.undoCount, session.history.undoName)
+        }
+        let applied = try await distorted(applying: true), committed = try await distorted(applying: false)
+        #expect(applied.0.transform == committed.0.transform && applied.undoName == "Distort" && applied.undoName == committed.undoName)
+        let a = try #require(applied.0.asset?.image), b = try #require(committed.0.asset?.image)
+        #expect(a.width == b.width && a.height == b.height && a.dataProvider?.data == b.dataProvider?.data)
+    }
+
+    @Test func applyingWithoutADistortionCommitsAtOnce() async throws {
+        let session = EditorSession()
+        session.createDocument(width: 100, height: 60)
+        let context = try BrushRaster.context(width: 20, height: 20, mask: false)
+        context.setFillColor(CGColor(srgbRed: 1, green: 0, blue: 0, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: 20, height: 20))
+        let image = try #require(context.makeImage())
+        session.insert(ImportedImage(image: image, thumbnail: image, name: "Red"))
+        session.selectTool(.move)
+        session.beginTransform(persistent: true)
+        var draft = try #require(session.transformEdit?.draft)
+        draft.origin.x += 7
+        session.previewTransform(draft)
+        await session.applyTransform()
+        #expect(session.transformEdit == nil && session.history.undoName == "Transform Layer")
+        #expect(session.activeLayer?.transform.origin.x == draft.origin.x)
+    }
 }

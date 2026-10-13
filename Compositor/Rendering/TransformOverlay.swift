@@ -90,7 +90,7 @@ final class TransformOverlay: NSView {
     var antsPhase: CGFloat = 0
 
     override func draw(_ dirtyRect: NSRect) {
-        drawLayoutGrid()
+        drawLayoutGrid(in: dirtyRect)
         drawGuides()
         if session.tool == .crop { drawCrop() }
         else if let line = gradientLine { drawGradientLine(line) }
@@ -100,12 +100,20 @@ final class TransformOverlay: NSView {
         drawSnapGuides()
     }
 
-    /// Non-printing layout grid over the document: solid majors every 64 px, dotted 8 px subdivisions.
-    private func drawLayoutGrid() {
+    /// Non-printing layout grid over the document: solid majors every 64 px, dotted 8 px subdivisions. Only the
+    /// lines crossing `dirtyRect` are stroked, and only across it: the overlay redraws on every ants tick and drag,
+    /// and dashing every line the length of a large document each time is what that cost.
+    private func drawLayoutGrid(in dirtyRect: CGRect) {
         guard session.showsGrid, let document = session.document, let transform = documentToView,
               let context = NSGraphicsContext.current?.cgContext else { return }
         let size = document.size
         let scale = session.viewport.pointsPerPixel
+        // The document area the dirty rect shows, a grid step wider so lines on its edges are kept.
+        let shown = dirtyRect.applying(transform.inverted()).insetBy(dx: -LayoutGrid.step, dy: -LayoutGrid.step)
+            .intersection(CGRect(origin: .zero, size: size))
+        guard !shown.isNull, !shown.isEmpty else { return }
+        let columns = LayoutGrid.lines(along: size.width).filter { $0 >= shown.minX && $0 <= shown.maxX }
+        let rows = LayoutGrid.lines(along: size.height).filter { $0 >= shown.minY && $0 <= shown.maxY }
         let hairline = 1 / max(session.viewport.backingScale, 1)
         let subdivisionGap = LayoutGrid.step * scale
         context.saveGState()
@@ -114,14 +122,15 @@ final class TransformOverlay: NSView {
         context.setStrokeColor(NSColor(white: 0.55, alpha: 0.28).cgColor)
         if subdivisionGap >= 4 {
             context.setLineDash(phase: 0, lengths: [1 / max(scale, 0.0001), 2 / max(scale, 0.0001)])
+            // Dashes start from the document's edge, wherever the visible part begins, so they don't crawl.
             let path = CGMutablePath()
-            for x in LayoutGrid.lines(along: size.width) where !LayoutGrid.isMajor(x) {
-                path.move(to: CGPoint(x: x, y: 0))
-                path.addLine(to: CGPoint(x: x, y: size.height))
+            for x in columns where !LayoutGrid.isMajor(x) {
+                path.move(to: CGPoint(x: x, y: dashStart(shown.minY, scale: scale)))
+                path.addLine(to: CGPoint(x: x, y: shown.maxY))
             }
-            for y in LayoutGrid.lines(along: size.height) where !LayoutGrid.isMajor(y) {
-                path.move(to: CGPoint(x: 0, y: y))
-                path.addLine(to: CGPoint(x: size.width, y: y))
+            for y in rows where !LayoutGrid.isMajor(y) {
+                path.move(to: CGPoint(x: dashStart(shown.minX, scale: scale), y: y))
+                path.addLine(to: CGPoint(x: shown.maxX, y: y))
             }
             context.addPath(path)
             context.strokePath()
@@ -129,17 +138,24 @@ final class TransformOverlay: NSView {
         context.setLineDash(phase: 0, lengths: [])
         context.setStrokeColor(NSColor(white: 0.7, alpha: 0.45).cgColor)
         let majors = CGMutablePath()
-        for x in LayoutGrid.lines(along: size.width) where LayoutGrid.isMajor(x) {
-            majors.move(to: CGPoint(x: x, y: 0))
-            majors.addLine(to: CGPoint(x: x, y: size.height))
+        for x in columns where LayoutGrid.isMajor(x) {
+            majors.move(to: CGPoint(x: x, y: shown.minY))
+            majors.addLine(to: CGPoint(x: x, y: shown.maxY))
         }
-        for y in LayoutGrid.lines(along: size.height) where LayoutGrid.isMajor(y) {
-            majors.move(to: CGPoint(x: 0, y: y))
-            majors.addLine(to: CGPoint(x: size.width, y: y))
+        for y in rows where LayoutGrid.isMajor(y) {
+            majors.move(to: CGPoint(x: shown.minX, y: y))
+            majors.addLine(to: CGPoint(x: shown.maxX, y: y))
         }
         context.addPath(majors)
         context.strokePath()
         context.restoreGState()
+    }
+
+    /// Where a dotted line crossing from `start` begins: the last whole dash period (3 screen points, in document
+    /// pixels) at or before it, counted from the document's edge as a full-length line's would be.
+    private func dashStart(_ start: CGFloat, scale: CGFloat) -> CGFloat {
+        let period = 3 / max(scale, 0.0001)
+        return max(0, floor(start / period) * period)
     }
 
     /// User guides span the whole view, including the pasteboard.

@@ -28,17 +28,12 @@ extension EditorSession {
                 let edit = try LevelsEdit(layer: layer, selection: nil)
                 edit.settings = original.levels
                 levels = edit
-                let job = edit.previewJob
-                edit.histogramTask = Task { @MainActor [weak self, weak edit] in
-                    let bins = await Task.detached(priority: .userInitiated) { try? LevelsFilter.histogram(job) }.value
-                    guard let self, let edit, self.levels === edit, !Task.isCancelled else { return }
-                    if let bins { edit.histogram = bins }
-                    edit.histogramReady = true
-                }
+                prepareLevels(edit)
             case .hsv:
-                let edit = try HueSaturationEdit(layerID: layer.id, original: asset, selection: nil, transform: layer.transform)
+                let edit = HueSaturationEdit(layerID: layer.id, original: asset, selection: nil, transform: layer.transform)
                 edit.settings = original.resolvedHSV
                 hueSaturation = edit
+                prepareHueSaturation(edit)
             case .curves, .exposure, .gradientMap, .grain, .blackWhite, .colorBalance, .gaussianBlur, .motionBlur, .addNoise:
                 var settings = FilterSettings()
                 settings.curves = original.curves
@@ -113,6 +108,8 @@ extension EditorSession {
         levels?.previewTask?.cancel()
         levels?.histogramTask?.cancel()
         filterEdit?.previewTask?.cancel()
+        filterEdit?.whiteBalanceTask?.cancel()
+        hueSaturation?.setupTask?.cancel()
         hueSaturationTask?.cancel()
         hueSaturationPending = nil
         hueSampleMode = nil

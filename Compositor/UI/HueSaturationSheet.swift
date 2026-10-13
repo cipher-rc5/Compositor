@@ -134,9 +134,9 @@ struct SpectrumEditor: View {
 
     var body: some View {
         VStack(spacing: 5) {
-            spectrum(after: false)
+            spectrum(after: false).accessibilityLabel("Hues before the adjustment")
             handles
-            spectrum(after: true)
+            spectrum(after: true).accessibilityLabel("Hues after the adjustment")
             Text(settings.band.handles.map { "\(Int($0.rounded()))°" }.joined(separator: "   "))
                 .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
         }
@@ -154,7 +154,11 @@ struct SpectrumEditor: View {
         }
         .frame(height: 16)
         .clipShape(RoundedRectangle(cornerRadius: 3))
+        .accessibilityElement()
+        .accessibilityAddTraits(.isImage)
     }
+
+    private static let handleNames = ["Falloff start", "Range start", "Range end", "Falloff end"]
 
     /// Outer marks are the falloff shoulders; inner bars are the full-strength range.
     private var handles: some View {
@@ -181,6 +185,23 @@ struct SpectrumEditor: View {
                 .onEnded { _ in dragging = nil })
         }
         .frame(height: 12)
+        // Each handle is its own adjustable element to VoiceOver, a degree a step.
+        .accessibilityElement(children: .contain)
+        .accessibilityChildren {
+            ForEach(settings.band.handles.indices, id: \.self) { index in
+                let degrees = settings.band.handles[index]
+                Rectangle()
+                    .accessibilityLabel(Self.handleNames[index])
+                    .accessibilityValue("\(Int(degrees.rounded())) degrees")
+                    .accessibilityAdjustableAction { direction in
+                        switch direction {
+                        case .increment: settings.band.setHandle(index, to: degrees + 1)
+                        case .decrement: settings.band.setHandle(index, to: degrees - 1)
+                        @unknown default: break
+                        }
+                    }
+            }
+        }
     }
 
     private func nearestHandle(to degrees: Double) -> Int {

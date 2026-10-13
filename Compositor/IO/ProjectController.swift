@@ -8,28 +8,45 @@ final class ProjectController {
     weak var window: NSWindow?
     weak var workspace: ProjectWorkspace?
     private var saveGeneration = 0
+    /// Where a project restored after a crash was saved before. The sandbox's access to it ended with the launch
+    /// that crashed, so Save asks again, starting there.
+    var recoveredURL: URL?
+    /// Answers alerts instead of showing them. Lets tests take the Save / Don't Save / Cancel paths.
+    var alertResponder: ((NSAlert) -> NSApplication.ModalResponse)?
+    /// What the unsaved-changes question calls the project.
+    var displayName: String { (session.projectURL ?? recoveredURL)?.lastPathComponent ?? "Untitled" }
     var canStart: Bool {
         session.canStartProjectOperation && workspace?.isManaging != true
     }
     init(session: EditorSession) { self.session = session }
 
-    private func begin() -> Bool {
+    /// Import Images… shares the gate of every other project operation: a panel previewing the document (Hue/Saturation,
+    /// a filter), a sheet or a save would otherwise have images land under it.
+    func importImages() {
+        guard canStart else { NSSound.beep(); return }
+        session.showsImporter = true
+    }
+
+    private func begin() async -> Bool {
         guard session.canStartProjectOperation else { return false }
         session.cancelCrop()
-        session.commitTransform()
+        // A pending transform goes into the document first. One that resamples (a floating selection, a distortion)
+        // is rendered off the main thread, the session busy meanwhile so nothing else starts; then look again.
+        await session.settleTransform()
+        guard session.canStartProjectOperation else { return false }
         session.isProjectBusy = true
         return true
     }
 
     @discardableResult
     func save(asNew: Bool = false) async -> Bool {
-        guard session.document != nil, begin() else { return false }
+        guard session.document != nil, await begin() else { return false }
         defer { session.isProjectBusy = false }
         return await saveCurrent(asNew: asNew)
     }
 
     func exportPNG() async {
-        guard session.document != nil, begin() else { return }
+        guard session.document != nil, await begin() else { return }
         defer { session.isProjectBusy = false }
         guard let snapshot = session.projectSnapshot() else { return }
         let panel = NSSavePanel()
@@ -49,7 +66,7 @@ final class ProjectController {
     }
 
     func canvasSize() async {
-        guard let window, let document = session.document, begin() else { return }
+        guard let window, let document = session.document, await begin() else { return }
         defer { session.isProjectBusy = false }
         let options: CanvasSizeOptions? = await withCheckedContinuation { continuation in
             let sheet = NSWindow()
@@ -71,7 +88,7 @@ final class ProjectController {
     }
 
     func imageSize() async {
-        guard let window, let document = session.document, begin() else { return }
+        guard let window, let document = session.document, await begin() else { return }
         defer { session.isProjectBusy = false }
         let options: ImageSizeOptions? = await withCheckedContinuation { continuation in
             let sheet = NSWindow()
@@ -93,7 +110,7 @@ final class ProjectController {
     }
 
     func trim() async {
-        guard let window, session.document != nil, begin() else { return }
+        guard let window, session.document != nil, await begin() else { return }
         defer { session.isProjectBusy = false }
         let options: TrimOptions? = await withCheckedContinuation { continuation in
             let sheet = NSWindow()
@@ -107,17 +124,13 @@ final class ProjectController {
             })
             window.beginSheet(sheet)
         }
-        guard let options, let snapshot = session.projectSnapshot() else { return }
-        do {
-            guard let resized = try await ImageTrim.trim(snapshot, options: options) else {
-                return
-            }
-            session.applyDocumentSize(resized, actionName: "Trim")
-        } catch { await showError("Couldn’t trim image", error: error) }
+        guard let options else { return }
+        do { try await session.applyTrim(options) }
+        catch { await showError("Couldn’t trim image", error: error) }
     }
 
     func exportJPEG() async {
-        guard let window, session.document != nil, begin() else { return }
+        guard let window, session.document != nil, await begin() else { return }
         defer { session.isProjectBusy = false }
         guard let snapshot = session.projectSnapshot() else { return }
         do {
@@ -157,7 +170,8 @@ final class ProjectController {
             panel.allowedContentTypes = [.compositorProject]
             panel.canCreateDirectories = true
             panel.isExtensionHidden = false
-            panel.nameFieldStringValue = session.projectURL?.lastPathComponent ?? "Untitled.comp"
+            panel.nameFieldStringValue = (session.projectURL ?? recoveredURL)?.lastPathComponent ?? "Untitled.comp"
+            if session.projectURL == nil, let recoveredURL { panel.directoryURL = recoveredURL.deletingLastPathComponent() }
             panel.title = asNew ? "Save Project As" : "Save Project"
             let response: NSApplication.ModalResponse
             if let window { response = await panel.beginSheetModal(for: window) }
@@ -173,6 +187,10 @@ final class ProjectController {
             session.projectURL = destination
             session.history.markSaved()
             saveGeneration += 1
+            recoveredURL = nil
+            if let workspace, let tab = workspace.tabs.first(where: { $0.controller === self }) {
+                workspace.autosaver?.discard(tab.id)
+            }
             NSDocumentController.shared.noteNewRecentDocumentURL(destination)
             return true
         } catch {
@@ -184,7 +202,7 @@ final class ProjectController {
     @discardableResult
     func open(_ suppliedURL: URL? = nil) async -> Bool {
         if let workspace { return await workspace.open(suppliedURL) }
-        guard begin() else { return false }
+        guard await begin() else { return false }
         defer { session.isProjectBusy = false }
         var source = suppliedURL
         if source == nil {
@@ -224,7 +242,7 @@ final class ProjectController {
 
     func newCanvas() async {
         if let workspace { workspace.newCanvas(); return }
-        guard begin() else { return }
+        guard await begin() else { return }
         let proceed = await confirmReplacement()
         session.isProjectBusy = false
         if proceed { session.clearProject() }
@@ -234,7 +252,7 @@ final class ProjectController {
         if let workspace, let tab = workspace.tabs.first(where: { $0.controller === self }) {
             await workspace.close(tab.id); return
         }
-        guard begin() else { return }
+        guard await begin() else { return }
         let proceed = await confirmReplacement()
         session.isProjectBusy = false
         if proceed {
@@ -244,7 +262,7 @@ final class ProjectController {
     }
 
     func confirmQuit() async -> Bool {
-        guard begin() else { return false }
+        guard await begin() else { return false }
         defer { session.isProjectBusy = false }
         return await confirmReplacement()
     }
@@ -252,7 +270,7 @@ final class ProjectController {
     private func confirmReplacement() async -> Bool {
         guard session.isModified, session.document != nil else { return true }
         let alert = NSAlert()
-        alert.messageText = "Save changes to \(session.projectURL?.lastPathComponent ?? "Untitled")?"
+        alert.messageText = "Save changes to \(displayName)?"
         alert.informativeText = "Your changes will be lost if you don’t save them."
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
@@ -272,6 +290,7 @@ final class ProjectController {
     }
 
     private func show(_ alert: NSAlert) async -> NSApplication.ModalResponse {
+        if let alertResponder { return alertResponder(alert) }
         if let window { return await alert.beginSheetModal(for: window) }
         return alert.runModal()
     }

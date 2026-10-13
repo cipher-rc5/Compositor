@@ -1,107 +1,18 @@
 import SwiftUI
 
-nonisolated struct ImageLayer: Identifiable, Equatable {
-    static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.id == rhs.id && lhs.name == rhs.name && lhs.isVisible == rhs.isVisible && lhs.transform == rhs.transform
-            && lhs.asset?.image === rhs.asset?.image && lhs.parentID == rhs.parentID && lhs.isGroup == rhs.isGroup && lhs.opacity == rhs.opacity && lhs.blendMode == rhs.blendMode && lhs.mask == rhs.mask && lhs.maskSourceID == rhs.maskSourceID && lhs.adjustment == rhs.adjustment && lhs.shape == rhs.shape && lhs.text == rhs.text && lhs.effects == rhs.effects
-    }
-    let id: UUID
-    var asset: ImportedImage?
-    var transform: LayerTransform
-    var origin: CGPoint { transform.origin }
-    var name: String
-    var isVisible = true
-    var parentID: UUID?
-    var isGroup = false
-    var opacity: Double = 1
-    var blendMode: LayerBlendMode = .normal
-    var maskSourceID: UUID?
-    var mask: LayerMask?
-    var adjustment: LayerAdjustment?
-    /// Set on layers the Shape tool made; see `liveShape`.
-    var shape: LayerShape?
-    /// A stroke and drop shadow drawn around the layer, kept apart from its pixels.
-    var effects: LayerEffects?
-    var text: LayerText?
-    var size: CGSize { transform.size }
-
-    init(asset: ImportedImage, origin: CGPoint) {
-        self.id = UUID()
-        self.asset = asset
-        self.transform = LayerTransform(origin: origin, size: CGSize(width: asset.image.width, height: asset.image.height))
-        self.name = asset.name
-    }
-
-    init(name: String, blankSize: CGSize) {
-        self.id = UUID()
-        self.asset = nil // Allocate pixels when painting begins, not when adding an empty layer.
-        self.transform = LayerTransform(origin: .zero, size: blankSize)
-        self.name = name
-    }
-
-    init(id: UUID, asset: ImportedImage?, name: String, isVisible: Bool, transform: LayerTransform, parentID: UUID? = nil, isGroup: Bool = false, opacity: Double = 1, blendMode: LayerBlendMode = .normal, mask: LayerMask? = nil, maskSourceID: UUID? = nil, adjustment: LayerAdjustment? = nil, shape: LayerShape? = nil, effects: LayerEffects? = nil, text: LayerText? = nil) {
-        self.id = id
-        self.asset = asset
-        self.name = name
-        self.isVisible = isVisible
-        self.transform = transform
-        self.parentID = parentID
-        self.isGroup = isGroup
-        self.opacity = opacity
-        self.blendMode = blendMode
-        self.mask = mask
-        self.maskSourceID = maskSourceID
-        self.adjustment = adjustment
-        self.shape = shape
-        self.effects = effects
-        self.text = text
-    }
-}
-
-struct CanvasDocument: Equatable {
-    let id: UUID
-    let width: Int
-    let height: Int
-    var resolution: Double = 72
-    var layers: [ImageLayer] = [] // Bottom to top.
-    /// User-placed alignment lines. Saved with the project; undo covers them.
-    var guides: [CanvasGuide] = []
-    /// Part of the document so undo/redo covers selection changes. Not saved to disk.
-    var selection: DocumentSelection?
-    var size: CGSize { CGSize(width: width, height: height) }
-    init(id: UUID = UUID(), width: Int, height: Int, layers: [ImageLayer] = [], resolution: Double = 72, guides: [CanvasGuide] = []) {
-        self.id = id
-        self.width = width
-        self.height = height
-        self.layers = layers
-        self.resolution = resolution
-        self.guides = guides
-    }
-
-    // Geometry limit; raster memory limits will be established with image import.
-    static func validDimension(_ value: String) -> Int? {
-        guard let n = Int(value.trimmingCharacters(in: .whitespaces)),
-              (1...30_000).contains(n) else { return nil }
-        return n
-    }
-}
-
-enum NavigationTool: String, CaseIterable {
-    case move, marquee, lasso, wand, crop, brush, spotHealing, cloneStamp, blur, gradient, shape, type, eyedropper, hand, zoom
-    /// No tool (A): nothing in the tool rail is selected and canvas clicks do nothing.
-    case idle
-    /// Tools that paint with the brush tip, sharing its size, hardness, opacity, and keys.
-    var isBrushTool: Bool { self == .brush || self == .spotHealing || self == .cloneStamp || self == .blur }
-    /// Tools that draw and edit selections, sharing modifiers, moving, and nudging.
-    var isSelectionTool: Bool { self == .marquee || self == .lasso || self == .wand }
-    var symbol: String { self == .type ? "textformat" : self == .eyedropper ? "eyedropper" : self == .marquee ? "rectangle.dashed" : self == .lasso ? "lasso" : self == .wand ? "wand.and.stars" : self == .brush ? "paintbrush.pointed" : self == .spotHealing ? "bandage" : self == .cloneStamp ? "seal" : self == .blur ? "drop" : self == .gradient ? "square.bottomhalf.filled" : self == .shape ? "square.on.circle" : self == .crop ? "crop" : self == .move ? "arrow.up.left.and.arrow.down.right" : self == .hand ? "hand.draw" : "magnifyingglass" }
-    var label: String { self == .type ? "Type (T)" : self == .eyedropper ? "Eyedropper (I)" : self == .marquee ? "Marquee (M)" : self == .lasso ? "Lasso (L)" : self == .wand ? "Magic (W) · Tab switches Wand and Object" : self == .brush ? "Brush (B) · Eraser (E)" : self == .spotHealing ? "Spot Healing Brush (J)" : self == .cloneStamp ? "Clone Stamp (S) · Option-click sets the source" : self == .blur ? "Smear (R)" : self == .gradient ? "Gradient (G)" : self == .shape ? "Shape (U) · Shift-U switches Rectangle/Ellipse" : self == .crop ? "Crop (C)" : self == .move ? "Move / Transform (V)" : self == .hand ? "Hand (H)" : "Zoom (Z)" }
-}
-
 @Observable
 final class EditorSession {
     var skipsInitialClipboardCanvasSize = false
-    var document: CanvasDocument?
+    var document: CanvasDocument? {
+        // Kept apart so views that only care whether there is a canvas don't re-render on every stroke: Observation
+        // tracks `document` as a whole, so reading it at all invalidates a view whenever any pixel changes.
+        didSet {
+            let exists = document != nil
+            if hasDocument != exists { hasDocument = exists }
+        }
+    }
+    /// Whether a canvas is open. Changes only when one is created or closed, unlike `document`.
+    private(set) var hasDocument = false
     var canvasFocusRequest = 0
     var showsSampleRing = true
     var adjustmentOriginal: LayerAdjustment?
@@ -129,7 +40,8 @@ final class EditorSession {
     /// True once `isProjectBusy` has lasted longer than `busyIndicatorDelay`.
     private(set) var showsBusy = false
     static let busyIndicatorDelay: Duration = .milliseconds(250)
-    @ObservationIgnored private var busyIndicatorTask: Task<Void, Never>?
+    /// Waits out `busyIndicatorDelay` while busy; tests await it rather than sleeping for as long.
+    @ObservationIgnored private(set) var busyIndicatorTask: Task<Void, Never>?
     private func updateBusyIndicator() {
         if isProjectBusy {
             guard busyIndicatorTask == nil, !showsBusy else { return }
@@ -146,21 +58,48 @@ final class EditorSession {
         }
     }
     private var projectWaiters: [CheckedContinuation<Void, Never>] = []
-    private var fileRequestWaiters: [CheckedContinuation<Void, Never>] = []
-    var canStartProjectOperation: Bool {
+    private var fileRequestWaiters: [() -> Void] = []
+    /// Everything in progress that the gates below have to wait for or work around.
+    var activeModals: Set<EditorModal> {
         _ = showsBusy // Re-evaluate in the UI when a long operation starts or ends.
-        return selectionAmountOperation == nil && textDraft == nil && !isProjectBusy && !isImporting && brushStroke == nil && warpStroke == nil && levels == nil && !showsNewDocument && !showsImporter && renamingLayerID == nil && importError == nil && adjustmentEditingID == nil && !showsConversionSheet
-    }
-    func waitForFileRequest() async {
-        while !canStartProjectOperation {
-            await withCheckedContinuation { fileRequestWaiters.append($0) }
+        var modals: Set<EditorModal> = []
+        if isProjectBusy { modals.insert(.busy) }
+        if isImporting { modals.insert(.importing) }
+        if showsNewDocument || showsImporter || importError != nil || showsConversionSheet || showsRawDevelop {
+            modals.insert(.dialog)
         }
+        if renamingLayerID != nil { modals.insert(.renamingLayer) }
+        if brushStroke != nil || warpStroke != nil { modals.insert(.stroke) }
+        if textDraft != nil { modals.insert(.typing) }
+        if selectionAmountOperation != nil { modals.insert(.selectionAmount) }
+        if levels != nil { modals.insert(.levels) }
+        if hueSaturation != nil { modals.insert(.hueSaturation) }
+        if filterEdit != nil { modals.insert(.filter) }
+        if adjustmentEditingID != nil { modals.insert(.adjustmentLayer) }
+        if pixelMove != nil { modals.insert(.pixelMove) }
+        if transformEdit != nil { modals.insert(.transform) }
+        if cropRect != nil { modals.insert(.crop) }
+        if gradientEdit != nil { modals.insert(.gradient) }
+        return modals
+    }
+    /// Save, Open, New, Trim, Canvas and Image Size, and files opened from Finder (which wait for it).
+    var canStartProjectOperation: Bool { !activeModals.contains(where: \.blocksProjectOperations) }
+    func waitForFileRequest() async {
+        // Loops because the waiting task resumes a turn later, by which time something else may have opened.
+        while !canStartProjectOperation {
+            await withCheckedContinuation { continuation in whenFileRequestsAllowed { continuation.resume() } }
+        }
+    }
+    /// Calls `body` as soon as nothing holds file requests up: now, or the moment the last thing that does ends.
+    /// Synchronous, so tests can watch the release without waiting on the main actor's queue.
+    func whenFileRequestsAllowed(_ body: @escaping () -> Void) {
+        if canStartProjectOperation { body() } else { fileRequestWaiters.append(body) }
     }
     private func resumeFileRequests() {
         guard canStartProjectOperation else { return }
         let waiters = fileRequestWaiters
         fileRequestWaiters.removeAll()
-        for waiter in waiters { waiter.resume() }
+        for waiter in waiters { waiter() }
     }
     func waitForProjectAccess() async {
         while isProjectBusy {
@@ -178,12 +117,6 @@ final class EditorSession {
     @ObservationIgnored var distortEffectsCache: [UUID: DistortEffectsCache] = [:]
     /// Document positions a move has just snapped to, drawn as guides while it lasts.
     @ObservationIgnored var snapGuides: (xs: [CGFloat], ys: [CGFloat]) = ([], [])
-    var snappingEnabled = true {
-        didSet {
-            if !snappingEnabled { snapGuides = ([], []) }
-            refreshCanvasPreview?()
-        }
-    }
     /// Where the last brush stroke ended, so a Shift-click paints a straight line on from it.
     @ObservationIgnored var lastBrushPoint: (point: CGPoint, layerID: UUID, mask: Bool)?
     /// Where the brush is while Smoothing trails it behind the pointer (see `smoothed`).
@@ -244,12 +177,23 @@ final class EditorSession {
     var heldSelectionMode: SelectionMode?
     /// The selection as it was when a drag-move began; the drag is one undo step.
     @ObservationIgnored var selectionMoveOrigin: DocumentSelection?
-    var pixelMove: PixelMove?
+    var pixelMove: PixelMove? { didSet { resumeFileRequests() } }
     @ObservationIgnored var pixelClipboard: PixelClipboard?
+    /// Where Copy puts its PNG for other apps. Tests give it a private pasteboard, so they neither read nor overwrite
+    /// what the person running them copied.
+    @ObservationIgnored var pasteboard: NSPasteboard = .general
+    /// The PNG being encoded and written to `pasteboard` after a Copy, so a test can wait for exactly that.
+    @ObservationIgnored var pasteboardWrite: Task<Void, Never>?
     var levels: LevelsEdit? { didSet { resumeFileRequests() } }
-    var hueSaturation: HueSaturationEdit?
+    var hueSaturation: HueSaturationEdit? { didSet { resumeFileRequests() } }
     /// The open filter (Filter menu), and the settings the next one starts from.
-    var filterEdit: FilterEdit?
+    var filterEdit: FilterEdit? {
+        didSet {
+            // Remove Background keeps Vision's mask only while its panel is open.
+            if filterEdit == nil, oldValue != nil { SubjectRemoval.forgetMask() }
+            resumeFileRequests()
+        }
+    }
     var filterSettings = FilterSettings()
     @ObservationIgnored var hueSaturationTask: Task<Void, Never>?
     /// The newest preview request while one is already rendering.
@@ -270,8 +214,15 @@ final class EditorSession {
     /// User guides. Hidden extras do not snap.
     var showsGuides = ToolDefaults.bool("guides", true) { didSet { ToolDefaults.set(showsGuides, "guides") } }
     var showsRulers = ToolDefaults.bool("rulers", false) { didSet { ToolDefaults.set(showsRulers, "rulers") } }
-    /// Master snap switch (View > Snap). On so today's layer/canvas snap keeps working.
-    var snapEnabled = ToolDefaults.bool("snap", true) { didSet { ToolDefaults.set(snapEnabled, "snap") } }
+    /// The one snap switch (View > Snap, ⇧⌘;): moves, crops and guides snap only while it is on, to whatever
+    /// View > Snap To allows.
+    var snapEnabled = ToolDefaults.bool("snap", true) {
+        didSet {
+            ToolDefaults.set(snapEnabled, "snap")
+            if !snapEnabled { snapGuides = ([], []) }
+            refreshCanvasPreview?()
+        }
+    }
     var snapToGuides = ToolDefaults.bool("snapGuides", true) { didSet { ToolDefaults.set(snapToGuides, "snapGuides") } }
     var snapToGrid = ToolDefaults.bool("snapGrid", false) { didSet { ToolDefaults.set(snapToGrid, "snapGrid") } }
     var snapToLayers = ToolDefaults.bool("snapLayers", true) { didSet { ToolDefaults.set(snapToLayers, "snapLayers") } }
@@ -290,6 +241,8 @@ final class EditorSession {
     @ObservationIgnored var brushStroke: BrushStroke? { didSet { resumeFileRequests() } }
     /// A Smudge or Liquify stroke in progress.
     @ObservationIgnored var warpStroke: WarpStroke? { didSet { resumeFileRequests() } }
+    /// A Clone Stamp or Blur stroke waiting for its source (see `BrushSampleWait`).
+    @ObservationIgnored var brushSampleWait: BrushSampleWait?
 
     var canTransform: Bool {
         guard canEditLayers else { return false }
@@ -332,6 +285,11 @@ final class EditorSession {
     func selectTool(_ value: NavigationTool) {
         if tool != value, !finishText() { return }
         guard !isProjectBusy, brushStroke == nil, warpStroke == nil, levels == nil else { return }
+        // A floating selection or distortion is resampled off the main thread first; the tool changes once it's in.
+        if tool != value, pendingTransformResamples {
+            Task { await settleTransform(); selectTool(value) }
+            return
+        }
         if tool != value { commitTransform(); cancelCrop(); resolveGradient(); cancelLasso(); cancelShape() }
         let from = Self.tipFamily(tool), to = Self.tipFamily(value)
         if from != to, let parked = parkedBrushTips[to] {
@@ -521,31 +479,12 @@ final class EditorSession {
     /// The RAW file being developed, and the settings the sheet is editing (see RawImporter).
     var rawDevelop: (url: URL, settings: RawDevelopSettings)?
     var showsRawDevelop = false { didSet { resumeFileRequests() } }
-    @ObservationIgnored private var rawContinuation: CheckedContinuation<RawDevelopSettings?, Never>?
+    @ObservationIgnored var rawContinuation: CheckedContinuation<RawDevelopSettings?, Never>?
     /// Tests assign this to develop without a sheet.
     @ObservationIgnored var confirmRawDevelop: ((URL, RawDevelopSettings) async -> RawDevelopSettings?)?
-
-    /// Puts the develop sheet up and waits for the choice; nil means the import was cancelled.
-    func developRaw(_ url: URL) async -> RawDevelopSettings? {
-        let asShot = RawImporter.asShot(url) ?? RawDevelopSettings()
-        if let confirmRawDevelop { return await confirmRawDevelop(url, asShot) }
-        return await withCheckedContinuation { continuation in
-            rawContinuation = continuation
-            rawDevelop = (url, asShot)
-            showsRawDevelop = true
-        }
-    }
-    func finishRawDevelop(_ settings: RawDevelopSettings?) {
-        showsRawDevelop = false
-        rawDevelop = nil
-        Task { await RawImporter.Queue.shared.release() }
-        let continuation = rawContinuation
-        rawContinuation = nil
-        continuation?.resume(returning: settings)
-    }
-    @ObservationIgnored private var conversionContinuation: CheckedContinuation<Bool, Never>?
+    @ObservationIgnored var conversionContinuation: CheckedContinuation<Bool, Never>?
     /// Cancel pressed while a Photoshop file was still being read.
-    @ObservationIgnored private var conversionCancelled = false
+    @ObservationIgnored var conversionCancelled = false
     var opacityEditLayerID: UUID?
     var blendPreview: (layerID: UUID, mode: LayerBlendMode)?
     @ObservationIgnored var refreshCanvasPreview: (() -> Void)?
@@ -560,10 +499,7 @@ final class EditorSession {
     var renamingLayerID: UUID? { didSet { resumeFileRequests() } }
     let history = DocumentHistory()
     var isModified: Bool { history.isModified }
-    var canUseHistory: Bool {
-        _ = showsBusy
-        return selectionAmountOperation == nil && textDraft == nil && !isProjectBusy && !isImporting && brushStroke == nil && warpStroke == nil && levels == nil && !showsNewDocument && !showsImporter && renamingLayerID == nil && importError == nil && transformEdit == nil && !showsConversionSheet
-    }
+    var canUseHistory: Bool { !activeModals.contains(where: \.blocksHistory) }
     var canUndo: Bool { canUseHistory && (history.canUndo || gradientEdit != nil) }
     var canRedo: Bool { canUseHistory && history.canRedo }
 
@@ -597,17 +533,11 @@ final class EditorSession {
 
     func endEdit() { history.end(document: document, selection: activeLayerID) }
     var activeLayer: ImageLayer? { document?.layers.first { $0.id == activeLayerID } }
-    var canEditLayers: Bool {
-        _ = showsBusy
-        return selectionAmountOperation == nil && textDraft == nil && document != nil && brushStroke == nil && warpStroke == nil && !isProjectBusy && !isImporting && !showsNewDocument && !showsImporter && renamingLayerID == nil && transformEdit == nil && cropRect == nil && gradientEdit == nil && pixelMove == nil && hueSaturation == nil && levels == nil && filterEdit == nil && adjustmentEditingID == nil
-    }
+    var canEditLayers: Bool { document != nil && !activeModals.contains(where: \.blocksLayerEdits) }
 
     func addBlankLayer() {
         guard canEditLayers, let document else { return }
-        let names = Set(document.layers.map(\.name))
-        var number = 1
-        while names.contains("Layer \(number)") { number += 1 }
-        var layer = ImageLayer(name: "Layer \(number)", blankSize: document.size)
+        var layer = ImageLayer(name: document.unusedName("Layer"), blankSize: document.size)
         layer.parentID = activeLayer?.isGroup == true ? activeLayerID : activeLayer?.parentID
         if let parent = layer.parentID { collapsedGroupIDs.remove(parent) }
         var insertion = document.layers.firstIndex { $0.id == activeLayerID }.map { $0 + 1 } ?? document.layers.count
@@ -684,16 +614,6 @@ final class EditorSession {
     }
     func endVisibilitySwipe() { endEdit() }
 
-    func reorderLayers(from offsets: IndexSet, to destination: Int) {
-        guard canEditLayers, var layers = document?.layers.reversed().map({ $0 }),
-              offsets.allSatisfy({ layers.indices.contains($0) }), (0...layers.count).contains(destination) else { return }
-        // List order is top-to-bottom; the compositor stores bottom-to-top.
-        layers.move(fromOffsets: offsets, toOffset: destination)
-        beginEdit("Reorder Layers")
-        defer { endEdit() }
-        document?.layers = layers.reversed()
-    }
-
     func canMoveActiveLayer(by offset: Int) -> Bool {
         guard canEditLayers, let activeLayer else { return false }
         let siblings = document?.layers.filter { $0.parentID == activeLayer.parentID } ?? []
@@ -701,193 +621,26 @@ final class EditorSession {
         return siblings.indices.contains(index + offset)
     }
     func moveActiveLayer(by offset: Int) {
-        guard canMoveActiveLayer(by: offset), let activeLayer, let layers = document?.layers else { return }
+        guard canMoveActiveLayer(by: offset), let activeLayer, var layers = document?.layers else { return }
         let siblings = layers.filter { $0.parentID == activeLayer.parentID }
         guard let index = siblings.firstIndex(where: { $0.id == activeLayer.id }),
               let a = layers.firstIndex(where: { $0.id == activeLayer.id }),
               let b = layers.firstIndex(where: { $0.id == siblings[index + offset].id }) else { return }
+        layers.swapAt(a, b)
+        // As a drag does (`placeLayer`): a layer moved into a clipping stack joins it, and one moved out of it, or
+        // below its base, stops clipping instead of clipping to something that's no longer under it.
+        Self.adoptClipping(activeLayer.id, in: &layers)
+        Self.releaseDetachedClipping(in: &layers)
         beginEdit("Reorder Layers")
-        document?.layers.swapAt(a, b)
+        document?.layers = layers
         endEdit()
     }
-    private struct ImportRequest {
+    struct ImportRequest {
         let files: [(url: URL, scoped: Bool)]
         let point: CGPoint?
         let completion: CheckedContinuation<Void, Never>
     }
-    private var pendingImports: [ImportRequest] = []
-
-    func importImages(_ urls: [URL], at point: CGPoint? = nil) async {
-        guard !urls.isEmpty else { return }
-        if brushStroke != nil { await finishBrush() }
-        cancelCrop()
-        commitTransform()
-        // Hold sandbox grants while requests wait behind an in-progress decode.
-        let files = urls.map { (url: $0, scoped: $0.startAccessingSecurityScopedResource()) }
-        await waitForProjectAccess()
-        await withCheckedContinuation { completion in
-            pendingImports.append(ImportRequest(files: files, point: point, completion: completion))
-            if !isImporting {
-                isImporting = true
-                Task { await drainImports() }
-            }
-        }
-    }
-
-    private func drainImports() async {
-        var failures: [String] = []
-        while !pendingImports.isEmpty {
-          let request = pendingImports.removeFirst()
-          let psdOnly = request.files.allSatisfy { PSDReader.matches($0.0) }
-          beginEdit(psdOnly ? "Import Photoshop File" : "Import Images")
-          // No document: the first successful image determines the canvas, regardless of drop point.
-          let point = document == nil ? nil : request.point
-          for (url, scoped) in request.files {
-            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-            do {
-                guard url.isFileURL else { throw ImageImportError.unsupported }
-                let usedPixels = document?.layers.reduce(0) { total, layer in
-                    guard let image = layer.asset?.image else { return total }
-                    return total + image.width * image.height
-                } ?? 0
-                if RawImporter.matches(url) {
-                    guard let size = RawImporter.pixelSize(url) else { throw ImageImportError.unreadable }
-                    guard size.width <= 30_000, size.height <= 30_000,
-                          size.width * size.height <= 100_000_000 - usedPixels else { throw ImageImportError.tooLarge }
-                    guard let settings = await developRaw(url) else { continue }
-                    // Seconds of work: off the main actor, or pressing Import freezes the window.
-                    guard let developed = await RawImporter.Queue.shared.develop(url, settings: settings, limit: nil)
-                    else { throw ImageImportError.unreadable }
-                    let thumbnail = try PixelAdjust.thumbnail(of: developed)
-                    insert(ImportedImage(image: developed, thumbnail: thumbnail,
-                                         name: url.deletingPathExtension().lastPathComponent), centeredAt: point)
-                } else if PSDReader.matches(url) {
-                    beginPSDReading(title: "Open “\(url.lastPathComponent)”?", confirmTitle: "Import")
-                    let imported: PSDImport
-                    do {
-                        let parsed = try await ImageImporter.shared.loadPhotoshop(url, remainingPixels: 100_000_000 - usedPixels)
-                        let assets = try await ImageImporter.shared.photoshopAssets(parsed)
-                        imported = try PSDDocumentBuilder.makeImport(parsed, assets: assets)
-                    } catch {
-                        endPSDReading()
-                        throw error
-                    }
-                    if !(await finishPSDReading(imported.conversions)) { continue }
-                    try insertPhotoshop(imported, named: url.deletingPathExtension().lastPathComponent, centeredAt: point)
-                } else {
-                    let asset = try await ImageImporter.shared.decode(url, remainingPixels: 100_000_000 - usedPixels)
-                    insert(asset, centeredAt: point)
-                }
-            } catch {
-                failures.append("\(url.lastPathComponent): \(error.localizedDescription)")
-            }
-          }
-          endEdit()
-          request.completion.resume()
-        }
-        isImporting = false
-        if !failures.isEmpty { importError = failures.joined(separator: "\n\n") }
-    }
-
-    func insert(_ asset: ImportedImage, centeredAt point: CGPoint? = nil) {
-        beginEdit("Import Image")
-        defer { endEdit() }
-        if document == nil {
-            document = CanvasDocument(width: asset.image.width, height: asset.image.height)
-            viewport.fit(documentSize: document!.size)
-        }
-        guard let document else { return }
-        let center = point ?? CGPoint(x: CGFloat(document.width) / 2, y: CGFloat(document.height) / 2)
-        var layer = ImageLayer(asset: asset, origin: CGPoint(
-            x: floor(center.x - CGFloat(asset.image.width) / 2),
-            y: floor(center.y - CGFloat(asset.image.height) / 2)))
-        layer.parentID = activeLayer?.isGroup == true ? activeLayerID : activeLayer?.parentID
-        if let parent = layer.parentID { collapsedGroupIDs.remove(parent) }
-        self.document?.layers.append(layer)
-        activeLayerID = layer.id
-    }
-
-    /// Puts the sheet up before the file is read, so a big PSD doesn't leave the click unanswered.
-    /// `finishPSDReading` fills it in, or takes it away when there is nothing to report.
-    func beginPSDReading(title: String, confirmTitle: String) {
-        guard confirmConversions == nil else { return }
-        conversionCancelled = false
-        conversionRequest = PSDConversionRequest(title: title, confirmTitle: confirmTitle, conversions: [], isReading: true)
-        showsConversionSheet = true
-    }
-    func finishPSDReading(_ conversions: [PSDConversion]) async -> Bool {
-        if let confirmConversions {
-            if conversions.isEmpty { return true }
-            return await confirmConversions(conversions)
-        }
-        if conversionCancelled { endPSDReading(); return false }
-        guard !conversions.isEmpty else { endPSDReading(); return true }
-        return await withCheckedContinuation { continuation in
-            conversionContinuation = continuation
-            conversionRequest?.conversions = conversions
-            conversionRequest?.isReading = false
-        }
-    }
-    /// Takes the sheet away without an answer: nothing to report, or the read failed.
-    func endPSDReading() {
-        guard conversionContinuation == nil else { return }
-        showsConversionSheet = false
-        conversionRequest = nil
-    }
-    func confirmPSDConversions(_ conversions: [PSDConversion], title: String, confirmTitle: String) async -> Bool {
-        if let confirmConversions { return await confirmConversions(conversions) }
-        return await withCheckedContinuation { continuation in
-            conversionContinuation = continuation
-            conversionRequest = PSDConversionRequest(title: title, confirmTitle: confirmTitle, conversions: conversions)
-            showsConversionSheet = true
-        }
-    }
-
-    func finishConversion(_ confirmed: Bool) {
-        if !confirmed, conversionRequest?.isReading == true { conversionCancelled = true }
-        showsConversionSheet = false
-        conversionRequest = nil
-        let continuation = conversionContinuation
-        conversionContinuation = nil
-        continuation?.resume(returning: confirmed)
-    }
-
-    func insertPhotoshop(_ imported: PSDImport, named: String, centeredAt point: CGPoint? = nil) throws {
-        beginEdit("Import Photoshop File")
-        defer { endEdit() }
-        var incoming = imported.layers
-        let wrapping = document != nil
-        let added = incoming.count + (wrapping ? 1 : 0)
-        if (document?.layers.count ?? 0) + added > 10_000 { throw ImageImportError.tooLarge }
-        if document == nil {
-            document = CanvasDocument(width: imported.width, height: imported.height, layers: incoming, resolution: imported.resolution)
-            viewport.fit(documentSize: document!.size)
-            activeLayerID = incoming.last(where: { $0.parentID == nil })?.id ?? incoming.last?.id
-            return
-        }
-        guard document != nil else { return }
-        var group = ImageLayer(name: named, blankSize: document!.size)
-        group.isGroup = true
-        group.parentID = activeLayer?.isGroup == true ? activeLayerID : activeLayer?.parentID
-        if let point {
-            let box = incoming.filter { !$0.isGroup }.reduce(CGRect.null) { $0.union(CGRect(origin: $1.origin, size: $1.size)) }
-            if !box.isNull, !box.isInfinite, !box.isEmpty, box.origin.x.isFinite, box.origin.y.isFinite {
-                let dx = point.x - box.midX, dy = point.y - box.midY
-                for index in incoming.indices {
-                    incoming[index].transform.origin.x += dx
-                    incoming[index].transform.origin.y += dy
-                }
-            }
-        }
-        for index in incoming.indices where incoming[index].parentID == nil {
-            incoming[index].parentID = group.id
-        }
-        self.document?.layers.append(group)
-        self.document?.layers.append(contentsOf: incoming)
-        if let parent = group.parentID { collapsedGroupIDs.remove(parent) }
-        collapsedGroupIDs.remove(group.id)
-        activeLayerID = group.id
-    }
+    var pendingImports: [ImportRequest] = []
 
     /// `emptyLayer` starts the canvas with a selected blank "Layer 1", as File > New does.
     func createDocument(width: Int, height: Int, emptyLayer: Bool = false) {

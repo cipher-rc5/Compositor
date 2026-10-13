@@ -97,6 +97,68 @@ struct CameraRawCurveControls: View {
         }
         .background(Color.black.opacity(0.35))
         .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+        // To VoiceOver the graph is one control, as the grade wheels are. On the point curve, increment and decrement
+        // raise and lower the selected point's output and named actions add or remove a point; on the parametric
+        // curve they move the middle divider, the sliders below carrying the amounts.
+        .accessibilityElement()
+        .accessibilityLabel(edit?.cameraRawCurvePage == .point
+                            ? "\((edit?.cameraRawPointChannel ?? .rgb).rawValue) point curve" : "Parametric curve dividers")
+        .accessibilityValue(curveAccessibilityValue)
+        .accessibilityAdjustableAction { direction in
+            let step: Double
+            switch direction {
+            case .increment: step = 1
+            case .decrement: step = -1
+            @unknown default: return
+            }
+            if edit?.cameraRawCurvePage == .point { nudgeSelectedPoint(by: step * 5 / 255) }
+            else { update { $0.curve.darkSplit += step * 2 } }
+        }
+        .accessibilityAction(named: "Add point") { addMiddlePoint() }
+        .accessibilityAction(named: "Remove point") { removeSelectedPoint() }
+        .accessibilityAction(named: "Reset") {
+            if edit?.cameraRawCurvePage == .point { store(CameraRawCurveSettings.linear) }
+            else { update { $0.curve.shadowSplit = 25; $0.curve.darkSplit = 50; $0.curve.lightSplit = 75 } }
+        }
+    }
+
+    private var curveAccessibilityValue: String {
+        if edit?.cameraRawCurvePage != .point {
+            return "Dividers at \(Int(raw.curve.shadowSplit.rounded())), \(Int(raw.curve.darkSplit.rounded())), and \(Int(raw.curve.lightSplit.rounded())) percent"
+        }
+        let points = currentPoints
+        if CameraRawCurveSettings.isLinear(points) { return "Straight line" }
+        let selected = selectedPoint.map { "Selected point: in \(Int(($0.x * 255).rounded())), out \(Int(($0.y * 255).rounded()))" } ?? ""
+        return "\(points.count) points. \(selected)"
+    }
+
+    /// The point `selectedPoint` names: the last one between the ends, or the white end when there is none.
+    private var selectedIndex: Int? {
+        let count = currentPoints.count
+        return count > 2 ? count - 2 : count > 0 ? count - 1 : nil
+    }
+
+    private func nudgeSelectedPoint(by delta: Double) {
+        guard let index = selectedIndex else { return }
+        var points = currentPoints
+        points[index].y = min(1, max(0, points[index].y + delta))
+        store(points)
+    }
+
+    /// A point on the curve where it already runs at the middle input, so adding it changes nothing until it moves.
+    private func addMiddlePoint() {
+        var points = currentPoints
+        guard !points.contains(where: { abs($0.x - 0.5) < 0.02 }) else { return }
+        let table = raw.curve.channelTable(points)
+        points.append(CurvePoint(x: 0.5, y: Double(table[128])))
+        store(points)
+    }
+
+    private func removeSelectedPoint() {
+        var points = currentPoints
+        guard points.count > 2, let index = selectedIndex else { return }
+        points.remove(at: index)
+        store(points)
     }
 
     private var currentPoints: [CurvePoint] {
@@ -301,6 +363,8 @@ struct CameraRawMixerControls: View {
                 }
                 .buttonStyle(.plain)
                 .help("Edit \(CameraRawMixerSettings.names[index]).")
+                .accessibilityLabel(CameraRawMixerSettings.names[index])
+                .accessibilityAddTraits(edit?.cameraRawMixerSwatch == index ? .isSelected : [])
             }
         }
     }
@@ -313,6 +377,8 @@ struct CameraRawMixerControls: View {
                     session.brushRevision += 1
                 } label: { Image(systemName: "eyedropper") }
                 .help("Click the picture to save a color. Up to eight colors.")
+                .accessibilityLabel("Pick a color from the picture")
+                .accessibilityAddTraits(edit?.samplesPointColor == true ? .isSelected : [])
                 .tint(edit?.samplesPointColor == true ? Color.accentColor : Color.secondary)
                 ForEach(raw.mixer.points.indices, id: \.self) { index in
                     let point = raw.mixer.points[index]
@@ -323,6 +389,8 @@ struct CameraRawMixerControls: View {
                     }
                     .buttonStyle(.plain)
                     .help("Select this picked color.")
+                    .accessibilityLabel("Picked color \(index + 1)")
+                    .accessibilityAddTraits(edit?.cameraRawPointIndex == index ? .isSelected : [])
                 }
             }
             if raw.mixer.points.indices.contains(edit?.cameraRawPointIndex ?? 0) {
@@ -419,7 +487,7 @@ struct CameraRawGradingControls: View {
         let wheel = raw.grading[keyPath: key]
         return VStack(spacing: 4) {
             Text(title).font(.caption).help("Drag inside the wheel. Angle sets hue, distance sets saturation.")
-            GradeWheel(hue: wheel.hue, saturation: wheel.saturation,
+            GradeWheel(title: title, hue: wheel.hue, saturation: wheel.saturation,
                        set: { hue, saturation in update { $0.grading[keyPath: key].hue = hue; $0.grading[keyPath: key].saturation = saturation } },
                        reset: { update { $0.grading[keyPath: key].hue = 0; $0.grading[keyPath: key].saturation = 0 } })
                 .frame(width: 86, height: 86)
@@ -429,6 +497,7 @@ struct CameraRawGradingControls: View {
             CameraRawSlider(value: wheel.luminance, range: -100...100, track: .plain, help: "Brightness added by this wheel.",
                             onChange: { value in update { $0.grading[keyPath: key].luminance = value } },
                             onReset: { update { $0.grading[keyPath: key].luminance = 0 } })
+                .accessibilityLabel("\(title) luminance")
         }
     }
 
@@ -447,6 +516,7 @@ struct CameraRawGradingControls: View {
 }
 
 private struct GradeWheel: View {
+    var title: String
     var hue: Double
     var saturation: Double
     var set: (Double, Double) -> Void
@@ -476,5 +546,19 @@ private struct GradeWheel: View {
             .onTapGesture(count: 2) { reset() }
             .help("Drag to set hue and saturation. Double-click to reset this wheel.")
         }
+        // To VoiceOver the wheel is one control: increment and decrement change saturation, named actions turn the hue.
+        .accessibilityElement()
+        .accessibilityLabel("\(title) color wheel")
+        .accessibilityValue("Hue \(Int(hue.rounded())) degrees, saturation \(Int(saturation.rounded()))")
+        .accessibilityAdjustableAction { direction in
+            switch direction {
+            case .increment: set(hue, min(100, saturation + 5))
+            case .decrement: set(hue, max(0, saturation - 5))
+            @unknown default: break
+            }
+        }
+        .accessibilityAction(named: "Turn hue forward") { set((hue + 10).truncatingRemainder(dividingBy: 360), saturation) }
+        .accessibilityAction(named: "Turn hue back") { set((hue + 350).truncatingRemainder(dividingBy: 360), saturation) }
+        .accessibilityAction(named: "Reset") { reset() }
     }
 }

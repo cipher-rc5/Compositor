@@ -123,19 +123,6 @@ struct ImageTrimTests {
         #expect(transRect == nil)
     }
 
-    @Test func trimImageDirectly() throws {
-        let image = try makeRGBAImage(width: 10, height: 10) { x, y in
-            if x >= 2 && x < 8 && y >= 2 && y < 8 {
-                return (r: 255, g: 128, b: 0, a: 255)
-            } else {
-                return (r: 0, g: 0, b: 0, a: 0)
-            }
-        }
-        let trimmed = try #require(ImageTrim.trimImage(image, options: TrimOptions(basedOn: .transparentPixels)))
-        #expect(trimmed.width == 6)
-        #expect(trimmed.height == 6)
-    }
-
     @Test func sessionTrimIntegrationAndUndo() async throws {
         let session = EditorSession()
         session.createDocument(width: 100, height: 100)
@@ -156,8 +143,8 @@ struct ImageTrimTests {
         #expect(session.document?.width == 100)
         #expect(session.document?.height == 100)
 
-        // Trim transparent pixels
-        let trimmed = try await session.trim(options: TrimOptions(basedOn: .transparentPixels))
+        // Trim transparent pixels, through what Image > Trim runs once its sheet is answered
+        let trimmed = try await session.applyTrim(TrimOptions(basedOn: .transparentPixels))
         #expect(trimmed)
 
         // Document should now be resized to 40x40

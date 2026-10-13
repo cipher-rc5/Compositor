@@ -78,4 +78,38 @@ struct DownsampleTests {
         let level = DownsampleCache.shared.image(mask, drawnAt: 0.25)
         #expect(level.width == 128 && level.colorSpace?.model == .monochrome && level.alphaInfo == .none)
     }
+
+    /// The budget covers the full-size images entries keep alive, not just their halvings; and an entry over the
+    /// budget on its own isn't kept, though its caller still gets the reduction it asked for.
+    @Test func cacheBudgetsCountTheirSourcesAndDropAnEntryTooBigToKeep() throws {
+        let source = try image(width: 200, height: 100) { x, y in UInt8((x + y) % 256) }
+        let halvings = 100 * 50 + 50 * 25
+        let roomy = DownsampleCache(pixelBudget: 200 * 100 + halvings)
+        let reduced = roomy.image(source, level: 2)
+        #expect(reduced.level == 2 && reduced.image.width == 50)
+        #expect(roomy.holds(source))
+        #expect(roomy.retainedPixels == 200 * 100 + halvings)
+        // A second image pushes the first out: the two sources don't both fit.
+        let other = try image(width: 200, height: 100) { x, _ in UInt8(x % 256) }
+        _ = roomy.image(other, level: 2)
+        #expect(!roomy.holds(source) && roomy.holds(other))
+        #expect(roomy.retainedPixels <= roomy.pixelBudget)
+
+        let tight = DownsampleCache(pixelBudget: halvings)
+        let unkept = tight.image(source, level: 2)
+        #expect(unkept.level == 2 && unkept.image.width == 50)
+        #expect(!tight.holds(source))
+        #expect(tight.retainedPixels == 0)
+
+        // A painted layer's pieces count the snapshot they hold as well.
+        let patch = BrushPatch(rect: CGRect(x: 0, y: 0, width: 64, height: 64), image: try image(width: 64, height: 64) { _, _ in 255 })
+        let raster = RasterSnapshot(width: 200, height: 100, base: source, baseRect: CGRect(x: 0, y: 0, width: 200, height: 100), patches: [patch])
+        let pieces = TiledPieceCache(pixelBudget: 200 * 100)
+        #expect(pieces.pieces(for: raster, level: 0)?.isEmpty == false)
+        #expect(!pieces.holds(raster, level: 0), "its base alone fills the budget")
+        let room = TiledPieceCache(pixelBudget: 1_000_000)
+        _ = room.pieces(for: raster, level: 0)
+        #expect(room.holds(raster, level: 0))
+        #expect(room.retainedPixels > 200 * 100 + 64 * 64)
+    }
 }

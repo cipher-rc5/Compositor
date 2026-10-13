@@ -102,4 +102,31 @@ struct ShapeToolTests {
         #expect(session.shapeDraft?.cornerRadius == 0, "ellipses take no radius")
         session.cancelShape()
     }
+
+    /// A Line click without a drag makes nothing — its box grown by the stroke's thickness used to make a dot.
+    @Test func aLineClickWithoutADragMakesNothing() {
+        let session = makeSession()
+        session.shapeKind = .line
+        let count = session.history.undoCount, layers = session.document?.layers.count
+        session.beginShape(at: CGPoint(x: 30, y: 30))
+        session.finishShape()
+        drag(session, from: CGPoint(x: 30, y: 30), to: CGPoint(x: 30.4, y: 30.2))
+        #expect(session.shapeDraft == nil && session.document?.layers.count == layers && session.history.undoCount == count)
+        drag(session, from: CGPoint(x: 30, y: 30), to: CGPoint(x: 50, y: 30))
+        #expect(session.activeLayer?.name == "Line 1" && session.history.undoCount == count + 1)
+    }
+
+    /// Shape layers are named as other new layers are (`CanvasDocument.unusedName`): the kind and the first number free.
+    @Test func shapeNamesTakeTheFirstNumberNotInUse() {
+        let session = makeSession()
+        #expect(session.nextShapeName(.rectangle) == "Rectangle 1")
+        session.document?.layers[0].name = "Rectangle 1"
+        session.document?.layers.append(ImageLayer(name: "Rectangle 3", blankSize: CGSize(width: 10, height: 10)))
+        session.document?.layers.append(ImageLayer(name: "Ellipse 1", blankSize: CGSize(width: 10, height: 10)))
+        #expect(session.nextShapeName(.rectangle) == "Rectangle 2")
+        #expect(session.nextShapeName(.ellipse) == "Ellipse 2")
+        #expect(session.nextShapeName(.line) == "Line 1")
+        session.document = nil
+        #expect(session.document == nil && session.nextShapeName(.ellipse) == "Ellipse 1")
+    }
 }

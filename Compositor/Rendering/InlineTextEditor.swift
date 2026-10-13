@@ -42,6 +42,8 @@ final class InlineTextEditor: NSView, NSTextViewDelegate {
     private var synchronizing = false
     private var logicalSize = CGSize(width: 360, height: 160)
     private var handleSize: CGFloat = 6
+    /// The transform the editor is actually showing. Point text grows as it is typed, so this is not always the
+    /// draft's own transform, and a resize has to start from what is on screen or the text jumps.
     private var shownTransform: LayerTransform?
     private struct Geometry: Equatable {
         let transform: LayerTransform
@@ -53,8 +55,6 @@ final class InlineTextEditor: NSView, NSTextViewDelegate {
     private var measuredStyle: LayerTextStyle?
     private var measuredSize: CGSize = .zero
     private var resize: (handle: Int, draft: TextDraft, transform: LayerTransform, start: CGPoint)?
-    /// The transform the editor is actually showing. Point text grows as it is typed, so this is not always the
-    /// draft's own transform, and a resize has to start from what is on screen or the text jumps.
     override var isFlipped: Bool { true }
 
     init(canvas: CanvasView) {
@@ -240,10 +240,7 @@ final class InlineTextEditor: NSView, NSTextViewDelegate {
 
     /// Every mouse move while the box is open, wherever the pointer is. Tracking areas stop arriving once the text
     /// surface has the mouse, which left the cursor stuck on whatever it was last set to.
-    // Torn down in deinit, which is nonisolated in Swift 6; the monitor is an opaque
-    // `Any?` the compiler can't prove Sendable, and this view only ever deinits on the
-    // main thread.
-    nonisolated(unsafe) private var moveMonitor: Any?
+    private var moveMonitor: Any?
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         if let moveMonitor { NSEvent.removeMonitor(moveMonitor); self.moveMonitor = nil }
@@ -254,7 +251,8 @@ final class InlineTextEditor: NSView, NSTextViewDelegate {
             return event
         }
     }
-    deinit {
+    // Isolated, so it can read the main-actor monitor it removes.
+    isolated deinit {
         if let moveMonitor { NSEvent.removeMonitor(moveMonitor) }
     }
 

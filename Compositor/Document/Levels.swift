@@ -1,5 +1,6 @@
 import AppKit
 import Observation
+import os
 
 nonisolated enum LevelsChannel: String, CaseIterable, Sendable, Codable {
     case rgb = "RGB", red = "Red", green = "Green", blue = "Blue"
@@ -55,7 +56,7 @@ nonisolated enum LevelsHistogramDisplay {
     }
 }
 
-nonisolated struct LevelsJob: @unchecked Sendable {
+nonisolated struct LevelsJob: Sendable {
     let image: CGImage
     let settings: LevelsSettings
     let selection: SelectionClip?
@@ -71,11 +72,10 @@ nonisolated enum LevelsFilter {
         }
         guard let data = context.data else { throw ExportError.render }
         let pixels = data.assumingMemoryBound(to: UInt8.self)
-        let count = job.image.width * job.image.height
         // The tables are for colors, not colors already multiplied by their alpha, and `levels_apply` already
         // divides each channel by its alpha before the lookup and multiplies it back after. Doing it here as
         // well ran a soft edge through the conversion twice: 50% grey at half alpha came out at a quarter.
-        levels_apply(pixels, count, tables)
+        levels_apply(pixels, job.image.width, job.image.height, context.bytesPerRow, tables)
         guard let image = context.makeImage() else { throw ExportError.render }
         if let selection = job.selection {
             return try PixelAdjust.blend(image, over: job.image, through: selection, pixelToDocument: job.mapping, isMask: false)
@@ -94,9 +94,10 @@ nonisolated enum LevelsFilter {
             BrushRaster.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h), mask: true, context: mask)
             coverageContext = mask
         }
+        guard let data = context.data else { throw ExportError.render }
         var bins = Array(repeating: 0.0, count: 1024)
-        levels_histogram(context.data!.assumingMemoryBound(to: UInt8.self),
-            coverageContext?.data?.assumingMemoryBound(to: UInt8.self), w * h, &bins)
+        levels_histogram(data.assumingMemoryBound(to: UInt8.self), w, h, context.bytesPerRow,
+            coverageContext?.data?.assumingMemoryBound(to: UInt8.self), coverageContext?.bytesPerRow ?? 0, &bins)
         return (0..<4).map { Array(bins[($0 * 256)..<(($0 + 1) * 256)]) }
     }
 }
@@ -108,35 +109,44 @@ final class LevelsEdit {
     let transform: LayerTransform
     let selection: SelectionClip?
     let mapping: CGAffineTransform
-    let previewSource: CGImage
-    let previewMapping: CGAffineTransform
+    /// What previews and the histogram read: the layer, or a copy of one larger than `previewLimit`, which
+    /// `histogramTask` makes off the main actor before previews start.
+    @ObservationIgnored private(set) var previewSource: CGImage
+    @ObservationIgnored private(set) var previewMapping: CGAffineTransform
     var sampleMode: LevelsSample?
     var settings = LevelsSettings()
     var preview = true
     var committing = false
     var histogram: [[Double]] = Array(repeating: Array(repeating: 0, count: 256), count: 4)
     var histogramReady = false
+    /// Why the histogram could not be counted; Auto stays off without it.
+    var histogramError: String?
+    /// Why the last preview could not be made, shown in the panel.
+    var previewError: String?
     @ObservationIgnored var preparedPreview: CGImage?
     @ObservationIgnored var pending: LevelsJob?
     @ObservationIgnored var previewTask: Task<Void, Never>?
+    /// Makes the preview copy (when one is needed), then counts the histogram.
     @ObservationIgnored var histogramTask: Task<Void, Never>?
+    /// Set while previews wait for the copy `histogramTask` makes.
+    @ObservationIgnored private(set) var awaitsPreviewCopy: Bool
 
+    /// Full size up to 8000 pixels on a side: a levels preview is a lookup table per pixel, quick enough to run
+    /// on the whole layer, and a downscaled copy showed the canvas a coarse, pixelated version while dragging.
+    nonisolated static let previewLimit: CGFloat = 8000
+
+    /// Reads no pixels, so the panel opens at once on any layer (see `EditorSession.prepareLevels`).
     init(layer: ImageLayer, selection: SelectionClip?) throws {
-        layerID = layer.id; original = layer.asset!; transform = layer.transform; self.selection = selection
+        guard let asset = layer.asset else { throw ProjectError.invalid }
+        layerID = layer.id; original = asset; transform = layer.transform; self.selection = selection
         mapping = BrushRaster.pixelToDocument(transform, width: original.image.width, height: original.image.height)
-        // Full size up to 8000 pixels on a side: a levels preview is a lookup table per pixel, quick enough to run
-        // on the whole layer, and a downscaled copy showed the canvas a coarse, pixelated version while dragging.
-        let factor = min(1, 8000 / CGFloat(max(original.image.width, original.image.height)))
-        if factor < 1 {
-            let w = max(1, Int(CGFloat(original.image.width) * factor)), h = max(1, Int(CGFloat(original.image.height) * factor))
-            let context = try BrushRaster.context(width: w, height: h, mask: false)
-            let rect = CGRect(x: 0, y: 0, width: w, height: h)
-            if let raster = original.raster { raster.draw(in: rect, context: context) }
-            else { BrushRaster.draw(original.image, in: rect, mask: false, context: context) }
-            guard let image = context.makeImage() else { throw ExportError.render }
-            previewSource = image
-            previewMapping = BrushRaster.pixelToDocument(transform, width: w, height: h)
-        } else { previewSource = original.image; previewMapping = mapping }
+        previewSource = original.image
+        previewMapping = mapping
+        awaitsPreviewCopy = PixelAdjust.needsPreviewCopy(original.image, limit: Self.previewLimit)
+    }
+    func adopt(_ copy: PixelAdjust.PreviewCopy?) {
+        if let copy { previewSource = copy.image; previewMapping = copy.mapping }
+        awaitsPreviewCopy = false
     }
     func previewImage(for id: UUID) -> CGImage? { preview && id == layerID ? preparedPreview : nil }
     var previewJob: LevelsJob { LevelsJob(image: previewSource, settings: settings, selection: selection, mapping: previewMapping) }
@@ -154,14 +164,48 @@ extension EditorSession {
         do {
             let edit = try LevelsEdit(layer: layer, selection: selection?.clip(canvas: document.size))
             levels = edit
-            let job = edit.previewJob
-            edit.histogramTask = Task { @MainActor [weak self, weak edit] in
-                let result = await Task.detached(priority: .userInitiated) { try? LevelsFilter.histogram(job) }.value
-                guard let self, let edit, self.levels === edit, !Task.isCancelled else { return }
-                if let result { edit.histogram = result }
-                edit.histogramReady = true
-            }
+            prepareLevels(edit)
         } catch { brushError = error.localizedDescription }
+    }
+
+    /// Off the main actor: the smaller copy previews read when the layer is past `previewLimit`, then the histogram
+    /// of what they read. Both come from `edit.original`, the pixels OK adjusts and checks are still on the layer.
+    /// A failure is shown in the panel rather than leaving an empty histogram that makes Auto do nothing.
+    func prepareLevels(_ edit: LevelsEdit) {
+        let job = edit.previewJob, copies = edit.awaitsPreviewCopy, original = edit.original, transform = edit.transform
+        edit.histogramTask = Task { @MainActor [weak self, weak edit] in
+            let result: (copy: PixelAdjust.PreviewCopy?, bins: [[Double]]?, problem: String?)
+            do {
+                result = try await PixelAdjust.detached { () throws -> (PixelAdjust.PreviewCopy?, [[Double]]?, String?) in
+                    var job = job, copy: PixelAdjust.PreviewCopy?, problem: String?
+                    if copies {
+                        // Without the copy, previews and the histogram read the full-size layer: slower, but right.
+                        do { copy = try PixelAdjust.previewCopy(of: original.image, raster: original.raster,
+                                                                limit: LevelsEdit.previewLimit, placed: transform) }
+                        catch { problem = error.localizedDescription }
+                        try Task.checkCancellation()
+                    }
+                    if let copy { job = LevelsJob(image: copy.image, settings: job.settings, selection: job.selection, mapping: copy.mapping) }
+                    do { return (copy, try LevelsFilter.histogram(job), problem) }
+                    catch { return (copy, nil, error.localizedDescription) }
+                }
+            } catch {
+                return // Cancelled: the panel closed or OK took over.
+            }
+            guard let self, let edit, self.levels === edit, !Task.isCancelled else {
+                adjustmentLog.debug("A Levels histogram finished after its panel closed; it was discarded")
+                return
+            }
+            edit.adopt(result.copy)
+            if let bins = result.bins {
+                edit.histogram = bins
+                edit.histogramReady = true
+            } else {
+                edit.histogramError = "The histogram couldn’t be counted: \(result.problem ?? "")"
+                adjustmentLog.error("Levels histogram failed: \(result.problem ?? "", privacy: .public)")
+            }
+            self.renderLevelsPreview(edit)
+        }
     }
     func updateLevels(_ settings: LevelsSettings, preview: Bool) {
         guard let edit = levels, !edit.committing else { return }
@@ -176,12 +220,21 @@ extension EditorSession {
         renderLevelsPreview(edit)
     }
     private func renderLevelsPreview(_ edit: LevelsEdit) {
-        guard levels === edit, edit.previewTask == nil, let job = edit.pending else { return }
+        guard levels === edit, edit.previewTask == nil, !edit.awaitsPreviewCopy, let pending = edit.pending else { return }
         edit.pending = nil
+        // Read the preview copy as it is now: one made since this was queued replaces the full-size layer.
+        let job = LevelsJob(image: edit.previewSource, settings: pending.settings, selection: pending.selection, mapping: edit.previewMapping)
         edit.previewTask = Task { @MainActor [weak self, weak edit] in
-            let result = await Task.detached(priority: .userInitiated) { try? LevelsFilter.run(job) }.value
-            guard let self, let edit, self.levels === edit, !Task.isCancelled else { return }
+            let result: CGImage?, problem: String?
+            do { result = try await PixelAdjust.detached { try LevelsFilter.run(job) }; problem = nil }
+            catch is CancellationError { return }
+            catch { result = nil; problem = error.localizedDescription }
+            guard let self, let edit, self.levels === edit, !Task.isCancelled else {
+                adjustmentLog.debug("A Levels preview finished after its panel closed; it was discarded")
+                return
+            }
             edit.previewTask = nil
+            edit.previewError = problem
             if edit.preview, !edit.settings.isIdentity { edit.preparedPreview = result; self.brushRevision += 1 }
             self.renderLevelsPreview(edit)
         }
@@ -208,11 +261,9 @@ extension EditorSession {
             }.value
             guard let index = document?.layers.firstIndex(where: { $0.id == edit.layerID }),
                   let current = document?.layers[index], current.asset?.image === edit.original.image,
-                  current.transform == edit.transform else { return }
+                  current.transform == edit.transform else { reportDroppedApply("Levels"); return }
             beginEdit("Levels")
-            document?.layers[index] = ImageLayer(id: current.id, asset: asset, name: current.name, isVisible: current.isVisible,
-                transform: current.transform, parentID: current.parentID, isGroup: false,
-                opacity: current.opacity, blendMode: current.blendMode, mask: current.mask, maskSourceID: current.maskSourceID)
+            document?.layers[index] = current.replacingPixels(asset, mask: current.mask)
             endEdit()
         } catch { brushError = error.localizedDescription }
     }

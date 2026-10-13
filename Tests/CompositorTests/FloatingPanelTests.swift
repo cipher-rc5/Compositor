@@ -16,8 +16,14 @@ struct FloatingPanelTests {
         session.insert(ImportedImage(image: image, thumbnail: image, name: "Red"))
         return session
     }
-    /// Lets AppKit run its constraint/display pass, which is where hosting used to crash.
-    private func settle() { RunLoop.main.run(until: Date().addingTimeInterval(0.4)) }
+    /// Runs AppKit's constraint, layout and display passes now, which is where hosting used to crash, instead of
+    /// spinning the run loop for a while in the hope that they happen.
+    private func settle() {
+        for window in NSApp.windows where window.isVisible {
+            window.layoutIfNeeded()
+            window.displayIfNeeded()
+        }
+    }
 
     /// Cmd+U used to crash here: `.preferredContentSize` sizing made AppKit measure the
     /// SwiftUI view during its constraint pass, and the measurement invalidated layout

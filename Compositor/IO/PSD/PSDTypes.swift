@@ -3,7 +3,7 @@ import Foundation
 import UniformTypeIdentifiers
 
 nonisolated enum PSDError: LocalizedError, Equatable {
-    case truncated, unsupportedVersion, unsupportedColorMode, unsupportedDepth, unsupportedCompression
+    case truncated, unsupportedVersion, unsupportedColorMode, unsupportedDepth, unsupportedCompression, unrepresentable
     var errorDescription: String? {
         switch self {
         case .truncated: "The Photoshop file could not be read. It may be damaged or incomplete."
@@ -11,6 +11,7 @@ nonisolated enum PSDError: LocalizedError, Equatable {
         case .unsupportedColorMode: "Only 8-bit RGB Photoshop files can be imported."
         case .unsupportedDepth: "Only 8-bit RGB Photoshop files can be imported."
         case .unsupportedCompression: "This Photoshop file uses a layer compression method that isn’t supported."
+        case .unrepresentable: "This Photoshop file’s layers can’t be kept in a Compositor project."
         }
     }
 }
@@ -26,7 +27,7 @@ nonisolated struct PSDConversion: Identifiable, Equatable, Sendable {
     }
 }
 
-nonisolated struct PSDDocument: @unchecked Sendable {
+nonisolated struct PSDDocument: Sendable {
     var width: Int
     var height: Int
     var resolution: Double
@@ -34,7 +35,7 @@ nonisolated struct PSDDocument: @unchecked Sendable {
     var layers: [PSDRecord]
 }
 
-nonisolated struct PSDRecord: @unchecked Sendable {
+nonisolated struct PSDRecord: Sendable {
     var id: UUID
     var parentID: UUID?
     var name: String
@@ -52,10 +53,13 @@ nonisolated struct PSDRecord: @unchecked Sendable {
     var kind = PSDLayerKind.raster
     var shape: LayerShapeStyle?
     var shapeNotes: [String] = []
+    /// A folder nested deeper than a project allows. It isn't imported; its layers sit in the deepest
+    /// folder above it that fits, with its visibility and opacity already applied to them.
+    var isDissolved = false
 }
 
 nonisolated enum PSDLayerKind: Equatable, Sendable {
-    case raster, group, adjustment, text, smartObject, effects, vector, other
+    case raster, group, adjustment, text, smartObject, effects, vector
 }
 
 extension LayerBlendMode {

@@ -22,9 +22,9 @@ struct CompositorApp: App {
             .windowToolbarStyle(.unifiedCompact(showsTitle: false))
             .commands {
                 CommandGroup(replacing: .undoRedo) {
-                    // Dialog text fields keep native text undo; document history
-                    // is unavailable while an import or modal edit is active.
-                    if session.textDraft != nil || session.levels != nil || session.isProjectBusy || session.showsNewDocument || session.showsImporter || session.renamingLayerID != nil || session.transformEdit?.persistent == true {
+                    // While document history is unavailable (see `EditorModal.blocksHistory`), ⌘Z belongs to the
+                    // text field being edited, if any: a panel's or sheet's fields keep their own undo.
+                    if !session.canUseHistory {
                         Button("Undo") {
                             if NSApp.keyWindow?.firstResponder is NSTextView {
                                 NSApp.sendAction(Selector(("undo:")), to: nil, from: nil)
@@ -55,8 +55,8 @@ struct CompositorApp: App {
                         Task { await applicationDelegate.projects.open() }
                     }
                         .configuredKeyboardShortcut("o").disabled(!applicationDelegate.projects.canStart)
-                    Button("Import Images…") { session.showsImporter = true }
-                        .disabled(session.levels != nil || session.showsBusy || session.isImporting || session.showsNewDocument)
+                    Button("Import Images…") { applicationDelegate.projects.importImages() }
+                        .disabled(!applicationDelegate.projects.canStart)
                 }
                 CommandGroup(replacing: .saveItem) {
                     Button("Save") { Task { await applicationDelegate.projects.save() } }
@@ -92,8 +92,6 @@ struct CompositorApp: App {
                             .configuredKeyboardShortcut("-").disabled(session.document == nil)
                         Toggle("Pixel Grid (800% and above)", isOn: Binding(get: { session.showsPixelGrid },
                                                                               set: { session.showsPixelGrid = $0 }))
-                        Toggle("Snap", isOn: Binding(get: { session.snappingEnabled },
-                                                     set: { session.snappingEnabled = $0 }))
                         Toggle("Show Transform Controls", isOn: Binding(get: { session.showsTransformControls },
                                                                           set: { session.showsTransformControls = $0 }))
                             .configuredKeyboardShortcut("h").disabled(session.tool != .move || session.document == nil)
@@ -129,7 +127,7 @@ struct CompositorApp: App {
                         }
                     }
                     // ⌘H toggles the Move tool's transform controls instead of hiding the app, so Hide keeps its
-                    // place in the app menu without the shortcut.
+                    // place in the app menu without the shortcut. ⌥⌘H stays Hide Others, as listed in Keyboard Shortcuts.
                     CommandGroup(replacing: .appVisibility) {
                         Button("Hide Compositor") { NSApp.hide(nil) }
                         Button("Hide Others") { NSApp.hideOtherApplications(nil) }
@@ -154,7 +152,7 @@ struct CompositorApp: App {
                         else { NSSound.beep() }
                     }
                         .configuredKeyboardShortcut("c")
-                    Button("Copy Merged") { session.copyMergedSelection() }
+                    Button("Copy Merged") { Task { await session.copyMergedSelection() } }
                         .configuredKeyboardShortcut("c", modifiers: [.command, .shift]).disabled(!session.canCopyMerged)
                     Button("Paste") {
                         if NSApp.keyWindow?.firstResponder is NSTextView { NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil) }
@@ -203,14 +201,14 @@ struct CompositorApp: App {
                         .configuredKeyboardShortcut("i", modifiers: [.command, .shift])
                         .disabled(session.selection == nil || !session.canEditSelection)
                     Button("Layer's Pixels") {
-                        if let id = session.activeLayerID { session.loadLayerSelection(layerID: id) }
+                        if let id = session.activeLayerID { Task { await session.loadLayerSelection(layerID: id) } }
                     }
                         .disabled(session.activeLayer?.asset == nil || !session.canEditSelection)
                     Button("Subject") { Task { await session.selectSubject() } }
                         .configuredKeyboardShortcut("a", modifiers: [.command, .option])
                         .disabled(!session.canSelectSubject)
                     Button("Mask's Black Areas") {
-                        if let id = session.activeLayerID { session.loadMaskSelection(layerID: id) }
+                        if let id = session.activeLayerID { Task { await session.loadMaskSelection(layerID: id) } }
                     }
                         .disabled(session.activeLayer?.mask == nil || !session.canEditSelection)
                     Divider()
@@ -296,7 +294,7 @@ struct CompositorApp: App {
                     Button("Move Layer Down") { session.moveActiveLayer(by: -1) }
                         .configuredKeyboardShortcut("[").disabled(!session.canMoveActiveLayer(by: -1))
                     Group {
-                        Button(session.mergeTitle) { session.mergeLayers() }
+                        Button(session.mergeTitle) { Task { await session.mergeLayers() } }
                             .configuredKeyboardShortcut("e").disabled(!session.canMergeLayers)
                         Divider()
                         Button("Flip Layer Horizontal") { session.flipLayers(horizontally: true) }

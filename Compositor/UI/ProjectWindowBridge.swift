@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import os
 
 /// Intercepts only close approval and forwards SwiftUI's other window callbacks.
 struct ProjectWindowBridge: NSViewRepresentable {
@@ -27,6 +28,7 @@ final class ProjectWindowView: NSView {
         proxy.controller = controller
         controller.window = window
         controller.workspace?.window = window
+        if let window { installDelegate(in: window) }
     }
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -34,12 +36,24 @@ final class ProjectWindowView: NSView {
             guard let self, let window = self.window else { return }
             self.controller.window = window
             self.controller.workspace?.window = window
-            if window.delegate !== self.proxy {
-                self.proxy.previous = window.delegate
-                window.delegate = self.proxy
-            }
+            self.installDelegate(in: window)
         }
     }
+
+    /// The unsaved-changes question on close rests on the proxy staying the window's delegate, and SwiftUI owns the
+    /// window. Checked on every update, so if SwiftUI ever installs a delegate of its own the proxy goes back in
+    /// front of it (forwarding to it) instead of the window closing unasked.
+    private func installDelegate(in window: NSWindow) {
+        guard window.delegate !== proxy else { return }
+        if installedIn === window {
+            Self.log.fault("The window’s delegate was replaced; reinstalling the close confirmation in front of it")
+        }
+        proxy.previous = window.delegate
+        window.delegate = proxy
+        installedIn = window
+    }
+    private weak var installedIn: NSWindow?
+    private static let log = Logger.compositor("Window")
 }
 
 private final class ProjectWindowDelegate: NSObject, NSWindowDelegate {

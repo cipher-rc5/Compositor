@@ -1,9 +1,10 @@
 import Foundation
 import CoreGraphics
+import Synchronization
 
 /// Immutable, normalized layer-local coverage. Regular grayscale images use white
 /// for reveal, black for hide, and intermediate gray for soft coverage.
-nonisolated struct LayerMask: Equatable, @unchecked Sendable {
+nonisolated struct LayerMask: Equatable, Sendable {
     let asset: ImportedImage
     var isEnabled = true
     /// Where the mask sits on the document once it has been moved apart from its layer; nil while it covers the
@@ -127,7 +128,7 @@ nonisolated struct LayerMask: Equatable, @unchecked Sendable {
 
 /// Masks resampled into their layers' grids (`LayerMask.clipImage`), so redraws reuse them; the least recently used
 /// go beyond a few entries or a pixel budget.
-nonisolated final class MaskPlacementCache: @unchecked Sendable {
+nonisolated final class MaskPlacementCache: Sendable {
     static let shared = MaskPlacementCache()
     private struct Entry {
         let mask: CGImage
@@ -138,29 +139,31 @@ nonisolated final class MaskPlacementCache: @unchecked Sendable {
         let image: CGImage
         var lastUse: UInt64
     }
-    private var entries: [Entry] = []
-    private var clock: UInt64 = 0
-    private let lock = NSLock()
+    private struct State {
+        var entries: [Entry] = []
+        var clock: UInt64 = 0
+    }
+    private let state = Mutex(State())
 
     func image(mask: CGImage, placement: LayerTransform, layer: LayerTransform, width: Int, height: Int, build: () -> CGImage?) -> CGImage? {
-        lock.lock()
-        clock += 1
-        if let index = entries.firstIndex(where: { $0.mask === mask && $0.placement == placement && $0.layer == layer && $0.width == width && $0.height == height }) {
-            entries[index].lastUse = clock
-            let image = entries[index].image
-            lock.unlock()
-            return image
+        let cached = state.withLock { state -> CGImage? in
+            state.clock += 1
+            guard let index = state.entries.firstIndex(where: {
+                $0.mask === mask && $0.placement == placement && $0.layer == layer && $0.width == width && $0.height == height
+            }) else { return nil }
+            state.entries[index].lastUse = state.clock
+            return state.entries[index].image
         }
-        lock.unlock()
+        if let cached { return cached }
         guard let image = build() else { return nil }
         guard width * height <= 64_000_000 else { return image }
-        lock.lock()
-        entries.append(Entry(mask: mask, placement: placement, layer: layer, width: width, height: height, image: image, lastUse: clock))
-        while entries.count > 8 || entries.reduce(0, { $0 + $1.width * $1.height }) > 64_000_000,
-              let oldest = entries.indices.min(by: { entries[$0].lastUse < entries[$1].lastUse }) {
-            entries.remove(at: oldest)
+        state.withLock { state in
+            state.entries.append(Entry(mask: mask, placement: placement, layer: layer, width: width, height: height, image: image, lastUse: state.clock))
+            while state.entries.count > 8 || state.entries.reduce(0, { $0 + $1.width * $1.height }) > 64_000_000,
+                  let oldest = state.entries.indices.min(by: { state.entries[$0].lastUse < state.entries[$1].lastUse }) {
+                state.entries.remove(at: oldest)
+            }
         }
-        lock.unlock()
         return image
     }
 }

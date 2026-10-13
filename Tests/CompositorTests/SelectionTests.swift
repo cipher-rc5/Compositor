@@ -237,10 +237,10 @@ struct SelectionTests {
         return id
     }
 
-    @Test func cmdClickingAMaskSelectsItsBlackAreas() throws {
+    @Test func cmdClickingAMaskSelectsItsBlackAreas() async throws {
         let session = makeSession()
         let id = try maskedLayer(session)
-        session.loadMaskSelection(layerID: id)
+        await session.loadMaskSelection(layerID: id)
         #expect(session.history.undoName == "Load Mask Selection")
         #expect(try coverage(session, 25, 35) == 255)   // Black: selected.
         #expect(try coverage(session, 35, 45) == 0)     // White hole: not selected.
@@ -248,29 +248,29 @@ struct SelectionTests {
         #expect(try coverage(session, 59, 69) == 255 && coverage(session, 60, 70) == 0) // Exact pixel edges.
         // Shift adds and Option subtracts, like Cmd-Shift / Cmd-Option clicks.
         lasso(session, square(80, 80, 10))
-        session.loadMaskSelection(layerID: id, mode: .add)
+        await session.loadMaskSelection(layerID: id, mode: .add)
         #expect(try coverage(session, 85, 85) == 255 && coverage(session, 25, 35) == 255)
-        session.loadMaskSelection(layerID: id, mode: .subtract)
+        await session.loadMaskSelection(layerID: id, mode: .subtract)
         #expect(try coverage(session, 85, 85) == 255 && coverage(session, 25, 35) == 0)
     }
 
-    @Test func maskSelectionFollowsTheLayerTransformAndIgnoresAllWhiteMasks() throws {
+    @Test func maskSelectionFollowsTheLayerTransformAndIgnoresAllWhiteMasks() async throws {
         let session = makeSession(width: 200, height: 200)
         let id = try maskedLayer(session)
         let index = try #require(session.document?.layers.firstIndex { $0.id == id })
         // The layer and its mask stretched 2× from the canvas origin.
         session.document?.layers[index].transform = LayerTransform(origin: .zero, size: CGSize(width: 200, height: 200))
-        session.loadMaskSelection(layerID: id)
+        await session.loadMaskSelection(layerID: id)
         let bounds = try #require(session.selection).path.boundingBoxOfPath
         #expect(bounds == CGRect(x: 40, y: 60, width: 80, height: 80))
         session.deselect()
         session.addBlankLayer()
         session.addLayerMask(revealing: true)
-        session.loadMaskSelection(layerID: try #require(session.activeLayerID))
+        await session.loadMaskSelection(layerID: try #require(session.activeLayerID))
         #expect(session.selection == nil) // No black anywhere: nothing to select.
     }
 
-    @Test func cmdClickingALayerSelectsItsOpaquePixels() throws {
+    @Test func cmdClickingALayerSelectsItsOpaquePixels() async throws {
         let session = makeSession(width: 200, height: 200)
         // A 50×50 image: opaque ring with a transparent center, faint (25%) corner pixel.
         let context = try BrushRaster.context(width: 50, height: 50, mask: false)
@@ -284,18 +284,18 @@ struct SelectionTests {
         let id = try #require(session.activeLayerID)
         let index = try #require(session.document?.layers.firstIndex { $0.id == id })
         session.document?.layers[index].transform = LayerTransform(origin: CGPoint(x: 50, y: 50), size: CGSize(width: 100, height: 100))
-        session.loadLayerSelection(layerID: id)
+        await session.loadLayerSelection(layerID: id)
         #expect(session.history.undoName == "Load Layer Selection")
         #expect(session.selection?.path.boundingBoxOfPath == CGRect(x: 70, y: 70, width: 60, height: 60)) // 2× scale.
         #expect(try coverage(session, 75, 75) == 255)   // Opaque ring.
         #expect(try coverage(session, 100, 100) == 0)   // Transparent center.
         #expect(try coverage(session, 50, 50) == 0)     // 25% pixel is under the threshold.
         lasso(session, square(0, 0, 20))
-        session.loadLayerSelection(layerID: id, mode: .add)
+        await session.loadLayerSelection(layerID: id, mode: .add)
         #expect(try coverage(session, 10, 10) == 255 && coverage(session, 75, 75) == 255)
         session.addBlankLayer()
         let before = session.selection
-        session.loadLayerSelection(layerID: try #require(session.activeLayerID))
+        await session.loadLayerSelection(layerID: try #require(session.activeLayerID))
         #expect(session.selection == before) // An empty layer selects nothing.
     }
 

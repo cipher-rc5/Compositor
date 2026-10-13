@@ -259,19 +259,28 @@ static double tone_blacks(double y, double amount) {
     return camera_clamp(0.25 + (y - 0.25) * (1.0 - amount));
 }
 
+// Hue in degrees, 0 up to 360, of a straight color; 0 for a gray.
+static double pixel_hue_deg(double r, double g, double b) {
+    double maxc = fmax(r, fmax(g, b)), minc = fmin(r, fmin(g, b));
+    double chroma = maxc - minc;
+    if (chroma < 1e-6) return 0;
+    double hue;
+    if (maxc == r) hue = fmod((g - b) / chroma, 6.0);
+    else if (maxc == g) hue = (b - r) / chroma + 2.0;
+    else hue = (r - g) / chroma + 4.0;
+    hue = hue * 60.0;
+    if (hue < 0) hue += 360.0;
+    return hue;
+}
+
 static void vibrance_and_saturation(double *r, double *g, double *b, double vibrance, double saturation) {
     double lum = rec709(*r, *g, *b);
     double maxc = fmax(*r, fmax(*g, *b));
     double minc = fmin(*r, fmin(*g, *b));
     double chroma = maxc - minc;
     double sat = maxc <= 1e-8 ? 0 : chroma / maxc;
-    double hue = 0;
-    if (chroma > 1e-8) {
-        if (*r >= *g && *r >= *b) hue = 60.0 * fmod((*g - *b) / chroma, 6.0);
-        else if (*g >= *r && *g >= *b) hue = 60.0 * ((*b - *r) / chroma + 2.0);
-        else hue = 60.0 * ((*r - *g) / chroma + 4.0);
-        if (hue < 0) hue += 360.0;
-    }
+    // Below 1e-6 of chroma the hue reads as 0; whatever skin weight that gives, such a color is black to the byte.
+    double hue = pixel_hue_deg(*r, *g, *b);
     double skin = 0;
     if (hue >= 10.0 && hue <= 50.0) {
         skin = hue <= 30.0 ? (hue - 10.0) / 20.0 : (50.0 - hue) / 20.0;
@@ -348,10 +357,17 @@ void adjust_camera_raw(uint8_t *rgba, size_t width, size_t height, size_t stride
     }
 }
 
-static size_t clamped_index(int index, size_t limit) {
+static size_t clamped_index(long index, size_t limit) {
     if (index < 0) return 0;
     if ((size_t)index >= limit) return limit - 1;
     return (size_t)index;
+}
+
+// A zeroed plane of width × height floats, or NULL when it cannot be had (including when its size overflows).
+// Zeroed, so an entry a kernel skips (a transparent pixel) reads as 0 rather than whatever the heap held.
+static float *new_plane(size_t width, size_t height) {
+    if (height && width > SIZE_MAX / sizeof(float) / height) return NULL;
+    return calloc(width * height, sizeof(float));
 }
 
 // Edge-clamped box blur. `dst` may not alias `src`. Returns 0 when the temporary row buffer cannot be allocated.
@@ -360,7 +376,7 @@ static int box_blur_plane(const float *src, float *dst, size_t width, size_t hei
         memcpy(dst, src, width * height * sizeof(float));
         return 1;
     }
-    float *temp = malloc(width * height * sizeof(float));
+    float *temp = new_plane(width, height);
     if (!temp) return 0;
     int window = radius * 2 + 1;
     for (size_t y = 0; y < height; ++y) {
@@ -382,6 +398,48 @@ static int box_blur_plane(const float *src, float *dst, size_t width, size_t hei
         }
     }
     free(temp);
+    return 1;
+}
+
+// A box blur of only the pixels that are there. `src` must be 0 wherever `coverage` is 0; `coverage` is 1 for a pixel
+// with any alpha and 0 for a transparent one, or NULL when every pixel has alpha. Dividing by the blurred coverage
+// keeps transparent pixels from counting as black (or as gray, for saturation) and dragging the layer's edges and the
+// rims of its holes toward it. `scratch` is a plane for the blurred coverage. Returns 0 when memory runs out.
+static int blur_covered(const float *src, float *dst, const float *coverage, float *scratch,
+                        size_t width, size_t height, int radius) {
+    if (!box_blur_plane(src, dst, width, height, radius)) return 0;
+    if (!coverage) return 1;
+    if (!box_blur_plane(coverage, scratch, width, height, radius)) return 0;
+    size_t count = width * height;
+    for (size_t i = 0; i < count; ++i) dst[i] = scratch[i] > 1e-6f ? dst[i] / scratch[i] : 0;
+    return 1;
+}
+
+// Straight Rec. 709 luminance of every pixel into `luma`, 0 for transparent ones. When any pixel is transparent and
+// `coverage` is given, `*coverage` becomes a new plane marking the pixels that are there (see `blur_covered`);
+// otherwise it stays NULL. Returns 0 when that plane cannot be allocated.
+static int luma_plane(const uint8_t *rgba, size_t width, size_t height, size_t stride, float *luma, float **coverage) {
+    int holes = 0;
+    for (size_t y = 0; y < height; ++y) {
+        const uint8_t *row = rgba + y * stride;
+        for (size_t x = 0; x < width; ++x) {
+            const uint8_t *p = row + x * 4;
+            double alpha = p[3];
+            if (!alpha) { luma[y * width + x] = 0; holes = 1; continue; }
+            double r = fmin(1.0, p[0] / alpha), g = fmin(1.0, p[1] / alpha), b = fmin(1.0, p[2] / alpha);
+            luma[y * width + x] = (float)rec709(r, g, b);
+        }
+    }
+    if (!coverage) return 1;
+    *coverage = NULL;
+    if (!holes) return 1;
+    float *plane = new_plane(width, height);
+    if (!plane) return 0;
+    for (size_t y = 0; y < height; ++y) {
+        const uint8_t *row = rgba + y * stride;
+        for (size_t x = 0; x < width; ++x) plane[y * width + x] = row[x * 4 + 3] ? 1.0f : 0.0f;
+    }
+    *coverage = plane;
     return 1;
 }
 
@@ -469,21 +527,21 @@ void adjust_camera_raw_clip_overlay(uint8_t *rgba, size_t width, size_t height, 
     }
 }
 
-void adjust_camera_raw_effects(uint8_t *rgba, size_t width, size_t height, size_t stride,
-                               double texture, double clarity, double dehaze,
-                               double glow, int glowStyle, double glowRange, double glowSpread, double glowWarmth,
-                               double vignetteAmount, double vignetteMidpoint, double vignetteRoundness,
-                               double vignetteFeather, double vignetteHighlights, int vignetteStyle,
-                               double scale) {
-    if (width == 0 || height == 0) return;
-    if (texture == 0 && clarity == 0 && dehaze == 0 && !(glow > 0) && vignetteAmount == 0) return;
+int adjust_camera_raw_effects(uint8_t *rgba, size_t width, size_t height, size_t stride,
+                              double texture, double clarity, double dehaze,
+                              double glow, int glowStyle, double glowRange, double glowSpread, double glowWarmth,
+                              double vignetteAmount, double vignetteMidpoint, double vignetteRoundness,
+                              double vignetteFeather, double vignetteHighlights, int vignetteStyle,
+                              double scale) {
+    if (width == 0 || height == 0) return 0;
+    if (texture == 0 && clarity == 0 && dehaze == 0 && !(glow > 0) && vignetteAmount == 0) return 0;
     size_t count = width * height;
     float *luma = NULL, *fine = NULL, *coarse = NULL, *glowPlane = NULL;
     int glowRadius = 1;
     int failed = 0;
     if (texture != 0 || clarity != 0 || glow > 0) {
-        luma = malloc(count * sizeof(float));
-        if (!luma) return;
+        luma = new_plane(width, height);
+        if (!luma) return -1;
         for (size_t y = 0; y < height; ++y) {
             uint8_t *row = rgba + y * stride;
             for (size_t x = 0; x < width; ++x) {
@@ -497,11 +555,11 @@ void adjust_camera_raw_effects(uint8_t *rgba, size_t width, size_t height, size_
             }
         }
         if (texture != 0) {
-            fine = malloc(count * sizeof(float));
+            fine = new_plane(width, height);
             if (!fine || !box_blur_plane(luma, fine, width, height, effects_radius(1, scale))) failed = 1;
         }
         if (!failed && clarity != 0) {
-            coarse = malloc(count * sizeof(float));
+            coarse = new_plane(width, height);
             if (!coarse || !box_blur_plane(luma, coarse, width, height, effects_radius(4, scale))) failed = 1;
         }
         if (!failed && glow > 0) {
@@ -511,8 +569,8 @@ void adjust_camera_raw_effects(uint8_t *rgba, size_t width, size_t height, size_
             if (widened < 1) widened = 1;
             glowRadius = effects_radius(widened, scale);
             float threshold = (float)(0.55 + 0.4 * (glowRange / 100.0));
-            glowPlane = malloc(count * sizeof(float));
-            float *source = malloc(count * sizeof(float));
+            glowPlane = new_plane(width, height);
+            float *source = new_plane(width, height);
             if (!glowPlane || !source) failed = 1;
             else {
                 float denom = 1.0f - threshold;
@@ -530,7 +588,7 @@ void adjust_camera_raw_effects(uint8_t *rgba, size_t width, size_t height, size_
     }
     if (failed) {
         free(luma); free(fine); free(coarse); free(glowPlane);
-        return;
+        return -1;
     }
     double warmth = glowWarmth / 100.0;
     double glowRed, glowGreen, glowBlue, glowGain;
@@ -579,6 +637,7 @@ void adjust_camera_raw_effects(uint8_t *rgba, size_t width, size_t height, size_
     free(fine);
     free(coarse);
     free(glowPlane);
+    return 0;
 }
 
 static double lut_at(const float *lut, double value) {
@@ -725,25 +784,15 @@ static double detail_radius(double slider, double scale) {
     return radius;
 }
 
-static double pixel_hue_deg(double r, double g, double b) {
-    double maxc = fmax(r, fmax(g, b)), minc = fmin(r, fmin(g, b));
-    double chroma = maxc - minc;
-    if (chroma < 1e-6) return 0;
-    double hue;
-    if (maxc == r) hue = fmod((g - b) / chroma, 6.0);
-    else if (maxc == g) hue = (b - r) / chroma + 2.0;
-    else hue = (r - g) / chroma + 4.0;
-    hue = hue * 60.0;
-    if (hue < 0) hue += 360.0;
-    return hue;
-}
-
 static int hue_in_range(double hue, double low, double high) {
     if (low <= high) return hue >= low && hue <= high;
     return hue >= low || hue <= high;
 }
 
-static float sharpen_edge_at(const float *luma, size_t width, size_t height, size_t x, size_t y, int radius) {
+// Mean luminance difference to the eight neighbors `radius` away. Neighbors outside the image, or transparent ones
+// when `coverage` marks them, are not there and don't count as an edge.
+static float sharpen_edge_at(const float *luma, const float *coverage, size_t width, size_t height, size_t x, size_t y,
+                             int radius) {
     if (radius < 1) radius = 1;
     float center = luma[y * width + x];
     float sum = 0;
@@ -753,6 +802,7 @@ static float sharpen_edge_at(const float *luma, size_t width, size_t height, siz
             if (dx == 0 && dy == 0) continue;
             long sx = (long)x + dx, sy = (long)y + dy;
             if (sx < 0 || sy < 0 || (size_t)sx >= width || (size_t)sy >= height) continue;
+            if (coverage && coverage[sy * width + sx] == 0) continue;
             sum += fabsf(luma[sy * width + sx] - center);
             count++;
         }
@@ -760,22 +810,11 @@ static float sharpen_edge_at(const float *luma, size_t width, size_t height, siz
     return count ? sum / count : 0;
 }
 
-void adjust_camera_raw_sharpen_mask_overlay(uint8_t *rgba, size_t width, size_t height, size_t stride,
-                                            double sharpenRadius, double sharpenDetail, double sharpenMasking, double scale) {
-    if (width == 0 || height == 0) return;
-    size_t count = width * height;
-    float *luma = malloc(count * sizeof(float));
-    if (!luma) return;
-    for (size_t y = 0; y < height; ++y) {
-        uint8_t *row = rgba + y * stride;
-        for (size_t x = 0; x < width; ++x) {
-            uint8_t *p = row + x * 4;
-            double alpha = p[3];
-            if (!alpha) { luma[y * width + x] = 0; continue; }
-            double r = fmin(1.0, p[0] / alpha), g = fmin(1.0, p[1] / alpha), b = fmin(1.0, p[2] / alpha);
-            luma[y * width + x] = (float)rec709(r, g, b);
-        }
-    }
+int adjust_camera_raw_sharpen_mask_overlay(uint8_t *rgba, size_t width, size_t height, size_t stride,
+                                           double sharpenRadius, double sharpenDetail, double sharpenMasking, double scale) {
+    if (width == 0 || height == 0) return 0;
+    float *luma = new_plane(width, height), *coverage = NULL;
+    if (!luma || !luma_plane(rgba, width, height, stride, luma, &coverage)) { free(luma); return -1; }
     int radius = effects_radius(detail_radius(sharpenRadius, scale), 1);
     double threshold = (sharpenMasking / 100.0) * 0.35;
     double detailBoost = 0.5 + sharpenDetail / 100.0;
@@ -785,38 +824,33 @@ void adjust_camera_raw_sharpen_mask_overlay(uint8_t *rgba, size_t width, size_t 
             uint8_t *p = row + x * 4;
             double alpha = p[3];
             if (!alpha) continue;
-            float edge = sharpen_edge_at(luma, width, height, x, y, radius);
+            float edge = sharpen_edge_at(luma, coverage, width, height, x, y, radius);
             double mask = camera_clamp((edge * detailBoost - threshold) / fmax(0.04, 0.35 - threshold * 0.5));
             uint8_t gray = (uint8_t)lround(mask * alpha);
             p[0] = p[1] = p[2] = gray;
         }
     }
     free(luma);
+    free(coverage);
+    return 0;
 }
 
-void adjust_camera_raw_detail(uint8_t *rgba, size_t width, size_t height, size_t stride,
-                              double sharpenAmount, double sharpenRadius, double sharpenDetail, double sharpenMasking,
-                              double noiseLuminance, double noiseLuminanceDetail, double noiseLuminanceContrast,
-                              double noiseColor, double noiseColorDetail, double noiseColorSmoothness, double scale) {
-    if (width == 0 || height == 0) return;
-    if (sharpenAmount == 0 && noiseLuminance == 0 && noiseColor == 0) return;
-    size_t count = width * height;
-    float *luma = malloc(count * sizeof(float));
-    float *work = malloc(count * sizeof(float));
-    if (!luma || !work) { free(luma); free(work); return; }
-    for (size_t y = 0; y < height; ++y) {
-        uint8_t *row = rgba + y * stride;
-        for (size_t x = 0; x < width; ++x) {
-            uint8_t *p = row + x * 4;
-            double alpha = p[3];
-            if (!alpha) { luma[y * width + x] = 0; continue; }
-            double r = fmin(1.0, p[0] / alpha), g = fmin(1.0, p[1] / alpha), b = fmin(1.0, p[2] / alpha);
-            luma[y * width + x] = (float)rec709(r, g, b);
-        }
-    }
+// Every plane is allocated before any pixel changes, so running out of memory leaves the image as it was.
+int adjust_camera_raw_detail(uint8_t *rgba, size_t width, size_t height, size_t stride,
+                             double sharpenAmount, double sharpenRadius, double sharpenDetail, double sharpenMasking,
+                             double noiseLuminance, double noiseLuminanceDetail, double noiseLuminanceContrast,
+                             double noiseColor, double noiseColorDetail, double noiseColorSmoothness, double scale) {
+    if (width == 0 || height == 0) return 0;
+    if (sharpenAmount == 0 && noiseLuminance == 0 && noiseColor == 0) return 0;
+    float *luma = new_plane(width, height), *work = new_plane(width, height);
+    float *chroma = NULL, *chromaBlur = NULL, *coverage = NULL, *scratch = NULL;
+    int status = -1;
+    if (!luma || !work || !luma_plane(rgba, width, height, stride, luma, &coverage)) goto done;
+    if (coverage && !(scratch = new_plane(width, height))) goto done;
+    if (noiseColor > 0 && (!(chroma = new_plane(width, height)) || !(chromaBlur = new_plane(width, height)))) goto done;
     if (noiseLuminance > 0) {
         int radius = effects_radius(1.0 + noiseLuminance / 50.0, scale);
-        if (!box_blur_plane(luma, work, width, height, radius)) { free(luma); free(work); return; }
+        if (!blur_covered(luma, work, coverage, scratch, width, height, radius)) goto done;
         double strength = noiseLuminance / 100.0;
         double preserve = noiseLuminanceDetail / 100.0;
         double contrast = noiseLuminanceContrast / 100.0;
@@ -827,7 +861,7 @@ void adjust_camera_raw_detail(uint8_t *rgba, size_t width, size_t height, size_t
                 double alpha = p[3];
                 if (!alpha) continue;
                 size_t index = y * width + x;
-                float edge = sharpen_edge_at(luma, width, height, x, y, 1);
+                float edge = sharpen_edge_at(luma, coverage, width, height, x, y, 1);
                 double local = strength * (1.0 - preserve * fmin(1.0, edge * 6.0));
                 float blurred = work[index];
                 float target = (float)(luma[index] * (1.0 - local) + blurred * local);
@@ -841,9 +875,7 @@ void adjust_camera_raw_detail(uint8_t *rgba, size_t width, size_t height, size_t
     }
     if (noiseColor > 0) {
         int radius = effects_radius(1.0 + noiseColorSmoothness / 40.0, scale);
-        float *chroma = malloc(count * sizeof(float));
-        float *chromaBlur = malloc(count * sizeof(float));
-        if (!chroma || !chromaBlur) { free(chroma); free(chromaBlur); free(luma); free(work); return; }
+        // Transparent pixels keep the 0 the plane was allocated with, as `blur_covered` needs.
         for (size_t y = 0; y < height; ++y) {
             uint8_t *row = rgba + y * stride;
             for (size_t x = 0; x < width; ++x) {
@@ -856,9 +888,7 @@ void adjust_camera_raw_detail(uint8_t *rgba, size_t width, size_t height, size_t
                 chroma[y * width + x] = (float)s;
             }
         }
-        if (!box_blur_plane(chroma, chromaBlur, width, height, radius)) {
-            free(chroma); free(chromaBlur); free(luma); free(work); return;
-        }
+        if (!blur_covered(chroma, chromaBlur, coverage, scratch, width, height, radius)) goto done;
         double strength = noiseColor / 100.0;
         double preserve = noiseColorDetail / 100.0;
         for (size_t y = 0; y < height; ++y) {
@@ -879,10 +909,9 @@ void adjust_camera_raw_detail(uint8_t *rgba, size_t width, size_t height, size_t
                 write_premultiplied(p, r, g, b, alpha);
             }
         }
-        free(chroma);
-        free(chromaBlur);
     }
     if (sharpenAmount > 0) {
+        // Transparent pixels are still 0 in `luma`: the passes above only wrote the ones that are there.
         for (size_t y = 0; y < height; ++y) {
             uint8_t *row = rgba + y * stride;
             for (size_t x = 0; x < width; ++x) {
@@ -894,7 +923,7 @@ void adjust_camera_raw_detail(uint8_t *rgba, size_t width, size_t height, size_t
             }
         }
         int radius = effects_radius(detail_radius(sharpenRadius, scale), 1);
-        if (!box_blur_plane(luma, work, width, height, radius)) { free(luma); free(work); return; }
+        if (!blur_covered(luma, work, coverage, scratch, width, height, radius)) goto done;
         double amount = sharpenAmount / 100.0;
         double detailMix = sharpenDetail / 100.0;
         double threshold = (sharpenMasking / 100.0) * 0.35;
@@ -905,7 +934,7 @@ void adjust_camera_raw_detail(uint8_t *rgba, size_t width, size_t height, size_t
                 double alpha = p[3];
                 if (!alpha) continue;
                 size_t index = y * width + x;
-                float edge = sharpen_edge_at(luma, width, height, x, y, radius);
+                float edge = sharpen_edge_at(luma, coverage, width, height, x, y, radius);
                 double mask = camera_clamp((edge * (0.5 + detailMix) - threshold) / fmax(0.04, 0.35 - threshold * 0.5));
                 double high = luma[index] - work[index];
                 double sharpened = camera_clamp(luma[index] + high * amount * mask * (0.5 + detailMix));
@@ -915,8 +944,15 @@ void adjust_camera_raw_detail(uint8_t *rgba, size_t width, size_t height, size_t
             }
         }
     }
+    status = 0;
+done:
     free(luma);
     free(work);
+    free(chroma);
+    free(chromaBlur);
+    free(coverage);
+    free(scratch);
+    return status;
 }
 
 static void optics_defringe(double *r, double *g, double *b, double purpleAmount, double purpleLow, double purpleHigh,
@@ -937,10 +973,15 @@ static void optics_defringe(double *r, double *g, double *b, double purpleAmount
     *b = camera_clamp(lum + (*b - lum) * factor);
 }
 
-static void optics_chromatic(uint8_t *rgba, size_t width, size_t height, size_t stride, double strength) {
+// Room for a copy of the image's rows, or NULL when it cannot be had (including when its size overflows).
+static uint8_t *row_buffer(size_t height, size_t stride) {
+    if (height && stride > SIZE_MAX / height) return NULL;
+    return malloc(height * stride);
+}
+
+// `copy` is room for the image's rows; it is overwritten with them first.
+static void optics_chromatic(uint8_t *rgba, uint8_t *copy, size_t width, size_t height, size_t stride, double strength) {
     if (strength <= 0) return;
-    uint8_t *copy = malloc(height * stride);
-    if (!copy) return;
     for (size_t y = 0; y < height; ++y) memcpy(copy + y * stride, rgba + y * stride, width * 4);
     double cx = width * 0.5, cy = height * 0.5;
     double maxR = hypot(cx, cy);
@@ -963,7 +1004,6 @@ static void optics_chromatic(uint8_t *rgba, size_t width, size_t height, size_t 
             write_premultiplied(p, r, g, b, alpha);
         }
     }
-    free(copy);
 }
 
 static void optics_vignette_correct(double *r, double *g, double *b, size_t x, size_t y, size_t width, size_t height,
@@ -986,24 +1026,26 @@ static void optics_vignette_correct(double *r, double *g, double *b, size_t x, s
     }
 }
 
-void adjust_camera_raw_optics(uint8_t *rgba, size_t width, size_t height, size_t stride,
-                              int removeChromatic, int lensProfile, double profileDistortion, double profileVignetting,
-                              double distortionK, double purpleAmount, double purpleHueLow, double purpleHueHigh,
-                              double greenAmount, double greenHueLow, double greenHueHigh,
-                              double vignetteAmount, double vignetteMidpoint, double scale) {
-    if (width == 0 || height == 0) return;
+int adjust_camera_raw_optics(uint8_t *rgba, size_t width, size_t height, size_t stride,
+                             int removeChromatic, int lensProfile, double profileDistortion, double profileVignetting,
+                             double distortionK, double purpleAmount, double purpleHueLow, double purpleHueHigh,
+                             double greenAmount, double greenHueLow, double greenHueHigh,
+                             double vignetteAmount, double vignetteMidpoint, double scale) {
+    if (width == 0 || height == 0) return 0;
     double profileVignette = lensProfile ? profileVignetting / 100.0 : 0;
     double vignette = vignetteAmount + profileVignette * 35.0;
-    if (distortionK != 0) {
-        size_t bytes = height * stride;
-        uint8_t *copy = malloc(bytes);
-        if (!copy) return;
-        memcpy(copy, rgba, bytes);
-        lens_distort(copy, rgba, width, height, stride, distortionK);
+    // One copy serves both resampling steps, taken before either, so running out of memory changes nothing.
+    if (distortionK != 0 || removeChromatic) {
+        uint8_t *copy = row_buffer(height, stride);
+        if (!copy) return -1;
+        if (distortionK != 0) {
+            for (size_t y = 0; y < height; ++y) memcpy(copy + y * stride, rgba + y * stride, width * 4);
+            lens_distort(copy, rgba, width, height, stride, distortionK);
+        }
+        if (removeChromatic) optics_chromatic(rgba, copy, width, height, stride, 0.45);
         free(copy);
     }
-    if (removeChromatic) optics_chromatic(rgba, width, height, stride, 0.45);
-    if (purpleAmount == 0 && greenAmount == 0 && vignette == 0) return;
+    if (purpleAmount == 0 && greenAmount == 0 && vignette == 0) return 0;
     for (size_t y = 0; y < height; ++y) {
         uint8_t *row = rgba + y * stride;
         for (size_t x = 0; x < width; ++x) {
@@ -1016,6 +1058,7 @@ void adjust_camera_raw_optics(uint8_t *rgba, size_t width, size_t height, size_t
             write_premultiplied(p, r, g, b, alpha);
         }
     }
+    return 0;
 }
 
 void adjust_camera_raw_calibration(uint8_t *rgba, size_t width, size_t height, size_t stride,
@@ -1058,4 +1101,27 @@ void adjust_camera_raw_calibration(uint8_t *rgba, size_t width, size_t height, s
             write_premultiplied(p, r, g, b, alpha);
         }
     }
+}
+
+size_t camera_raw_average_linear(const uint8_t *rgba, size_t width, size_t height, size_t stride, double *average) {
+    double red = 0, green = 0, blue = 0;
+    size_t count = 0;
+    for (size_t y = 0; y < height; ++y) {
+        const uint8_t *row = rgba + y * stride;
+        for (size_t x = 0; x < width; ++x) {
+            const uint8_t *p = row + x * 4;
+            double alpha = p[3];
+            if (!alpha) continue;
+            red += srgb_to_linear(fmin(1.0, p[0] / alpha));
+            green += srgb_to_linear(fmin(1.0, p[1] / alpha));
+            blue += srgb_to_linear(fmin(1.0, p[2] / alpha));
+            count++;
+        }
+    }
+    if (count) {
+        average[0] = red / (double)count;
+        average[1] = green / (double)count;
+        average[2] = blue / (double)count;
+    }
+    return count;
 }

@@ -37,11 +37,25 @@ actor ImageExporter {
                       layer.maskFile == nil || snapshot.masks[layer.id] != nil else { throw ProjectError.missingImage }
             }
             try LiveMaskGraph.validate(snapshot.manifest.layers)
+            // A painted layer's pixels are made from its tiles when first read; one that can't be made would
+            // otherwise export as nothing. Only layers that are drawn: shown ones and folders, and live mask sources.
+            let drawn = Set(LayerHierarchy.entries(snapshot.manifest.layers).filter(\.visible).map(\.layer.id))
+                .union(snapshot.manifest.layers.compactMap(\.maskSourceID))
+            for id in drawn {
+                try snapshot.images[id]?.raster?.materialize()
+                try snapshot.masks[id]?.raster?.materialize()
+            }
+            // Effects that can't be drawn stop the export instead of leaving the layer without them.
+            var effectsFailure: Error?
             let live = LiveMaskRenderer(bounds: CGRect(x: 0, y: 0, width: width, height: height), source: { records[$0]?.maskSourceID }) { id, target in
                 guard let layer = records[id], let image = snapshot.images[id]?.image else { return }
                 let opacity = layer.effectiveOpacity(in: records)
                 let mask = snapshot.mask(for: layer).flatMap { $0.clipImage(placement: $0.placement, over: layer.transform, width: image.width, height: image.height) }
-                let effects = LayerEffectsRenderer.cached(image, mask: mask, effects: layer.effects)
+                let effects: (image: CGImage, inset: CGFloat)?
+                do { effects = try LayerEffectsRenderer.required(image, mask: mask, effects: layer.effects) } catch {
+                    effectsFailure = effectsFailure ?? LayerEffectsError.cannotExport(layer: layer.name, reason: error.localizedDescription)
+                    return
+                }
                 func drawLayer(_ mode: LayerBlendMode, _ into: CGContext) {
                     if let effects {
                         let grown = LayerEffectsRenderer.placed(layer.transform, image: effects.image, inset: effects.inset)
@@ -70,6 +84,7 @@ actor ImageExporter {
                 let clip = FolderMaskClip(image: image, transform: folder.transform)
                 return { clip.apply(center: folder.transform.center, in: $0) }
             }, in: context) { live.drawComposite($0, in: context) }
+            if let effectsFailure { throw effectsFailure }
             guard let image = context.makeImage() else { throw ExportError.render }
             return ExportRaster(image: image, resolution: snapshot.manifest.resolution ?? 72)
         }
@@ -138,7 +153,7 @@ actor ImageExporter {
     }
 }
 
-nonisolated struct ExportRaster: @unchecked Sendable {
+nonisolated struct ExportRaster: Sendable {
     let image: CGImage
     var resolution: Double = 72
 }
@@ -148,7 +163,7 @@ nonisolated struct JPEGOptions: Equatable, Sendable {
     var green: CGFloat = 1
     var blue: CGFloat = 1
 }
-nonisolated struct JPEGResult: @unchecked Sendable {
+nonisolated struct JPEGResult: Sendable {
     let data: Data
     let preview: CGImage
 }

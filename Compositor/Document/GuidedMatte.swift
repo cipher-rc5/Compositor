@@ -5,62 +5,21 @@ import Foundation
 /// hair and fur that a segmentation model cuts straight through. Core Image's own `CIGuidedFilter` does nothing on
 /// this system and its edge-preserving upsample barely moves the mask, so this does the arithmetic directly.
 nonisolated enum GuidedMatte {
-    /// Mean over a (2r+1)² square, as two running-sum passes — the cost doesn't grow with the radius.
-    static func box(_ source: [Float], width: Int, height: Int, radius: Int) -> [Float] {
-        let span = Float(radius * 2 + 1)
-        var pass = [Float](repeating: 0, count: width * height)
-        source.withUnsafeBufferPointer { src in
-            pass.withUnsafeMutableBufferPointer { out in
-                for y in 0..<height {
-                    let row = y * width
-                    var sum: Float = 0
-                    for x in -radius...radius { sum += src[row + min(width - 1, max(0, x))] }
-                    for x in 0..<width {
-                        out[row + x] = sum / span
-                        sum -= src[row + min(width - 1, max(0, x - radius))]
-                        sum += src[row + min(width - 1, max(0, x + radius + 1))]
-                    }
-                }
-            }
-        }
-        var result = [Float](repeating: 0, count: width * height)
-        pass.withUnsafeBufferPointer { src in
-            result.withUnsafeMutableBufferPointer { out in
-                for x in 0..<width {
-                    var sum: Float = 0
-                    for y in -radius...radius { sum += src[min(height - 1, max(0, y)) * width + x] }
-                    for y in 0..<height {
-                        out[y * width + x] = sum / span
-                        sum -= src[min(height - 1, max(0, y - radius)) * width + x]
-                        sum += src[min(height - 1, max(0, y + radius + 1)) * width + x]
-                    }
-                }
-            }
-        }
-        return result
-    }
-
     /// `mask` refined by `guide` (both 0–1, the same size). A bigger radius reaches further for detail; `epsilon`
-    /// decides how much of an edge in the guide counts, so a small one follows fine strands.
-    static func filter(mask: [Float], guide: [Float], width: Int, height: Int, radius: Int, epsilon: Float) -> [Float] {
+    /// decides how much of an edge in the guide counts, so a small one follows fine strands. In C
+    /// (`MattePixels.c`): it makes a dozen passes over every pixel.
+    static func filter(mask: [Float], guide: [Float], width: Int, height: Int, radius: Int, epsilon: Float) throws -> [Float] {
         let count = width * height
-        let meanGuide = box(guide, width: width, height: height, radius: radius)
-        let meanMask = box(mask, width: width, height: height, radius: radius)
-        var squares = [Float](repeating: 0, count: count), products = [Float](repeating: 0, count: count)
-        for i in 0..<count { squares[i] = guide[i] * guide[i]; products[i] = guide[i] * mask[i] }
-        let meanSquares = box(squares, width: width, height: height, radius: radius)
-        let meanProducts = box(products, width: width, height: height, radius: radius)
-        var slope = [Float](repeating: 0, count: count), offset = [Float](repeating: 0, count: count)
-        for i in 0..<count {
-            let variance = meanSquares[i] - meanGuide[i] * meanGuide[i]
-            let covariance = meanProducts[i] - meanGuide[i] * meanMask[i]
-            slope[i] = covariance / (variance + epsilon)
-            offset[i] = meanMask[i] - slope[i] * meanGuide[i]
-        }
-        let meanSlope = box(slope, width: width, height: height, radius: radius)
-        let meanOffset = box(offset, width: width, height: height, radius: radius)
+        guard width > 0, height > 0, radius >= 0, mask.count == count, guide.count == count else { throw ExportError.render }
         var result = [Float](repeating: 0, count: count)
-        for i in 0..<count { result[i] = min(1, max(0, meanSlope[i] * guide[i] + meanOffset[i])) }
+        let status = mask.withUnsafeBufferPointer { mask in
+            guide.withUnsafeBufferPointer { guide in
+                result.withUnsafeMutableBufferPointer { out in
+                    matte_guided_filter(mask.baseAddress, guide.baseAddress, width, height, radius, epsilon, out.baseAddress)
+                }
+            }
+        }
+        guard status == 0 else { throw MagicWand.Failure.memory }
         return result
     }
 
@@ -102,7 +61,7 @@ nonisolated enum GuidedMatte {
         let factor = min(1, limit / max(full.width, full.height))
         let width = max(1, Int((full.width * factor).rounded())), height = max(1, Int((full.height * factor).rounded()))
         let steps = max(1, Int((radius * Double(factor)).rounded()))
-        let refined = filter(mask: try levels(of: mask, width: width, height: height),
+        let refined = try filter(mask: try levels(of: mask, width: width, height: height),
                              guide: try levels(of: guide, width: width, height: height),
                              width: width, height: height, radius: steps, epsilon: 1e-4)
         let small = try image(refined, width: width, height: height)

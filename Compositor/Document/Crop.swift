@@ -120,7 +120,7 @@ extension EditorSession {
     /// `draft` nudged so the layer it places lines up with a nearby edge or center; `moving` is what is being
     /// dragged, and `tolerance` is in document pixels.
     func snappedMove(_ draft: LayerTransform, moving: Set<UUID>, tolerance: CGFloat) -> LayerTransform {
-        guard snappingEnabled else { snapGuides = ([], []); return draft }
+        guard snapEnabled else { snapGuides = ([], []); return draft }
         let corners = DistortWarp.corners(of: draft)
         let cornerXs = corners.map(\.x), cornerYs = corners.map(\.y)
         guard let minX = cornerXs.min(), let maxX = cornerXs.max(),

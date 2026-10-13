@@ -1,23 +1,23 @@
 import Foundation
 import CoreGraphics
 
-public enum TrimBasedOn: String, CaseIterable, Identifiable, Sendable {
+enum TrimBasedOn: String, CaseIterable, Identifiable, Sendable {
     case transparentPixels = "Transparent Pixels"
     case topLeftPixelColor = "Top Left Pixel Color"
     case bottomRightPixelColor = "Bottom Right Pixel Color"
 
-    public var id: String { rawValue }
+    var id: String { rawValue }
 }
 
-nonisolated public struct TrimOptions: Sendable, Equatable {
-    public var basedOn: TrimBasedOn
-    public var top: Bool
-    public var bottom: Bool
-    public var left: Bool
-    public var right: Bool
-    public var tolerance: UInt8
+nonisolated struct TrimOptions: Sendable, Equatable {
+    var basedOn: TrimBasedOn
+    var top: Bool
+    var bottom: Bool
+    var left: Bool
+    var right: Bool
+    var tolerance: UInt8
 
-    public init(
+    init(
         basedOn: TrimBasedOn = .transparentPixels,
         top: Bool = true,
         bottom: Bool = true,
@@ -33,29 +33,15 @@ nonisolated public struct TrimOptions: Sendable, Equatable {
         self.tolerance = tolerance
     }
 
-    public var trimsAny: Bool {
+    var trimsAny: Bool {
         top || bottom || left || right
     }
 }
 
-public enum TrimError: LocalizedError, Sendable {
-    case noContentToTrim
-    case invalidDimensions
-
-    public var errorDescription: String? {
-        switch self {
-        case .noContentToTrim:
-            return "No content remained after trimming."
-        case .invalidDimensions:
-            return "The trimmed image dimensions are invalid."
-        }
-    }
-}
-
-nonisolated public enum ImageTrim {
+nonisolated enum ImageTrim {
     /// Calculates the crop rectangle in document/image coordinates to trim according to the specified options.
     /// Returns nil if no non-trimmed content remains (e.g. fully transparent or single solid color).
-    public static func calculateTrimRect(in image: CGImage, options: TrimOptions) -> CGRect? {
+    static func calculateTrimRect(in image: CGImage, options: TrimOptions) -> CGRect? {
         guard options.trimsAny, image.width > 0, image.height > 0 else { return nil }
         let width = image.width
         let height = image.height
@@ -167,12 +153,6 @@ nonisolated public enum ImageTrim {
         return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
     }
 
-    /// Crops a CGImage directly using the calculated trim rectangle.
-    public static func trimImage(_ image: CGImage, options: TrimOptions) -> CGImage? {
-        guard let rect = calculateTrimRect(in: image, options: options) else { return nil }
-        return image.cropping(to: rect)
-    }
-
     /// Trims a ProjectSnapshot using the rendered canvas raster and CanvasResizer.
     /// Returns the trimmed snapshot, or nil if no content remained to trim.
     static func trim(_ snapshot: ProjectSnapshot, options: TrimOptions) async throws -> ProjectSnapshot? {
@@ -194,17 +174,14 @@ nonisolated public enum ImageTrim {
     }
 }
 
-@MainActor
 extension EditorSession {
+    /// Image > Trim once its sheet is answered: trims the canvas as `options` say, as one undo step. False when
+    /// nothing would be left. The caller holds the project busy flag (see `ProjectController.trim`).
     @discardableResult
-    func trim(options: TrimOptions = TrimOptions()) async throws -> Bool {
-        guard canStartProjectOperation, let snapshot = projectSnapshot() else { return false }
-        isProjectBusy = true
-        defer { isProjectBusy = false }
-        guard let trimmedSnapshot = try await ImageTrim.trim(snapshot, options: options) else {
-            return false
-        }
-        applyDocumentSize(trimmedSnapshot, actionName: "Trim")
+    func applyTrim(_ options: TrimOptions) async throws -> Bool {
+        guard let snapshot = projectSnapshot(),
+              let trimmed = try await ImageTrim.trim(snapshot, options: options) else { return false }
+        applyDocumentSize(trimmed, actionName: "Trim")
         return true
     }
 }

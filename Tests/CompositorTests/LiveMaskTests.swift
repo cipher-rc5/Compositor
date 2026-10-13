@@ -113,7 +113,7 @@ import Testing
         #expect(s.document?.layers[0].maskSourceID == nil)
         s.undo(); #expect(s.document?.layers.count == 2 && s.document?.layers[0].maskSourceID == source)
         var bad = snapshot.manifest.layers; bad[1].maskSourceID = target
-        #expect(throws: (any Error).self) { try LiveMaskGraph.validate(bad) }
+        #expect(throws: ProjectError.invalid) { try LiveMaskGraph.validate(bad) }
     }
     @Test func movingSourceChangesCoverageAndChainsMultiply() async throws {
         let s = try fixture()

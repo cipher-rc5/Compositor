@@ -1,4 +1,5 @@
 import AppKit
+import Metal
 import Testing
 @testable import Compositor
 
@@ -117,7 +118,9 @@ struct RasterSnapshotTests {
         }
     }
 
-    @Test func eightHundredPixelSoftStrokeHasNoPeriodicRidges() throws {
+    /// The GPU coverage path's smoothness; the software fallback has its own test above.
+    @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil, "needs a Metal device"))
+    func eightHundredPixelSoftStrokeHasNoPeriodicRidges() throws {
         #expect(MetalBrushCoverage.shared != nil)
         let session = session()
         session.beginBrush(at: CGPoint(x: 600, y: 1600))
@@ -131,5 +134,41 @@ struct RasterSnapshotTests {
             let alpha = (1000...3000).map { Int(bytes[y * context.bytesPerRow + $0 * 4 + 3]) }
             #expect(alpha.max()! - alpha.min()! <= 1)
         }
+    }
+
+    /// An effects preview of a painted layer is made from its tiles: asking the snapshot for its whole image would
+    /// make, and keep for the snapshot's life, a full-size copy of the layer. It must still look like one made from
+    /// that whole image.
+    @Test func effectsPreviewsOfAPaintedLayerReduceItsTilesWithoutMakingTheWholeImage() throws {
+        let session = session()
+        session.brushSettings.diameter = 300
+        session.beginBrush(at: CGPoint(x: 1000, y: 1000))
+        session.continueBrush(at: CGPoint(x: 3000, y: 2600))
+        #expect(session.finishBrushImmediately())
+        let asset = try #require(session.activeLayer?.asset)
+        let raster = try #require(asset.raster)
+        let effects = LayerEffects(stroke: StrokeEffect(size: 6, red: 0, green: 0, blue: 1, opacity: 1))
+        let preview = try EffectsPreviewCache.render(EffectsPreviewCache.Source(image: asset.image, raster: raster),
+                                                     mask: nil, effects: effects, sideLimit: 512)
+        #expect(!raster.hasMaterializedPixels)
+        #expect(max(preview.image.width, preview.image.height) <= 512)
+
+        // The same preview from the whole image.
+        let reference = try EffectsPreviewCache.render(asset.image, mask: nil, effects: effects, sideLimit: 512)
+        #expect(raster.hasMaterializedPixels)
+        #expect(reference.inset == preview.inset)
+        #expect(reference.image.width == preview.image.width && reference.image.height == preview.image.height)
+        func bytes(_ image: CGImage) throws -> [UInt8] {
+            let context = try BrushRaster.context(width: image.width, height: image.height, mask: false)
+            BrushRaster.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height), mask: false, context: context)
+            return Array(UnsafeBufferPointer(start: try #require(context.data).assumingMemoryBound(to: UInt8.self),
+                                             count: context.bytesPerRow * image.height))
+        }
+        let a = try bytes(preview.image), b = try bytes(reference.image)
+        let differences = zip(a, b).map { abs(Int($0) - Int($1)) }
+        // Core Graphics resamples a band a little differently from the whole image — each is as far from a Lanczos
+        // reduction as the other, a few levels on soft edges — so the two agree closely, not exactly.
+        #expect(differences.max() ?? 0 <= 32)
+        #expect(Double(differences.reduce(0, +)) / Double(differences.count) < 0.5)
     }
 }

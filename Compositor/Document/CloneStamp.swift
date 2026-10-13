@@ -34,16 +34,17 @@ extension EditorSession {
         return CGPoint(x: point.x + cloneOffset.width, y: point.y + cloneOffset.height)
     }
 
-    /// What a stroke copies from, at document size, taken when it starts: the active layer's own
-    /// pixels, or every visible layer as the canvas shows them.
-    func cloneSample(_ document: CanvasDocument) -> CGImage? {
-        guard let context = try? BrushRaster.context(width: document.width, height: document.height, mask: false) else { return nil }
-        if cloneSettings.sampleAllLayers {
-            drawLiveComposite(document, in: context)
-        } else if let layer = activeLayer, let image = layer.asset?.image {
-            let transform = displayedTransform(for: layer)
-            LayerRenderer.draw(image, transform: transform, center: transform.center, in: context)
-        }
-        return context.makeImage()
+    /// What a stroke copies from, at document size, taken when it starts: the active layer's own pixels, or every
+    /// visible layer as the canvas shows them. Only captured here; the stroke renders it off the main thread (see
+    /// `beginBrush`). Nil without a canvas.
+    func cloneSampleSource(_ document: CanvasDocument) -> SelectionSource? {
+        selectionSource(document, sampleAllLayers: cloneSettings.sampleAllLayers)
+    }
+
+    /// The Clone Stamp sample made at once, on the calling thread. Throws when it can't be made, which on a large
+    /// canvas is usually memory.
+    func cloneSample(_ document: CanvasDocument) throws -> CGImage {
+        guard let source = cloneSampleSource(document) else { throw ExportError.render }
+        return try source.render()
     }
 }

@@ -12,11 +12,6 @@ static inline uint32_t noise_hash(uint32_t x) {
 // Uniform in [0, 1).
 static inline float noise_unit(uint32_t key) { return (float)(noise_hash(key) >> 8) * (1.0f / 16777216.0f); }
 
-void noise_add(uint8_t *rgba, size_t width, size_t height, size_t stride,
-               float amount, int gaussian, int monochromatic, uint32_t seed) {
-    noise_add_at(rgba, width, height, stride, amount, gaussian, monochromatic, seed, 0, 0);
-}
-
 void noise_add_at(uint8_t *rgba, size_t width, size_t height, size_t stride,
                   float amount, int gaussian, int monochromatic, uint32_t seed,
                   int64_t origin_x, int64_t origin_y) {

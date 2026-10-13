@@ -1,7 +1,7 @@
 import AppKit
 
 /// Carries a CGImage out of a detached task.
-nonisolated private struct Box: @unchecked Sendable {
+nonisolated private struct Box: Sendable {
     let image: CGImage
     init(_ image: CGImage) { self.image = image }
 }
@@ -36,26 +36,29 @@ extension EditorSession {
 
     /// Fills the selection with the foreground or background color, as one undo step.
     /// With no selection it fills the whole layer; an empty selection fills nothing.
-    /// On a mask the palette is black/white, so this reveals or hides.
-    func fillSelection(with source: FillSource) async {
-        guard canEditPixels, let layer = activeLayer else { return }
+    /// On a mask the palette is black/white, so this reveals or hides. False when it couldn't be done.
+    @discardableResult
+    func fillSelection(with source: FillSource) async -> Bool {
+        guard canEditPixels, let layer = activeLayer else { return false }
         let value = paletteColor(background: source == .background)
         // A text layer that is still text takes the color as its own, rather than being painted over: the letters
         // change color and stay editable.
-        if !isMaskSelected, selection == nil, layer.liveText != nil, recolorText(layer.id, to: value) { return }
+        if !isMaskSelected, selection == nil, layer.liveText != nil, recolorText(layer.id, to: value) { return true }
         let color = isMaskSelected
             ? CGColor(gray: value.red, alpha: 1)
             : CGColor(colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!, components: [value.red, value.green, value.blue, 1])!
-        await applyPixelEdit(to: layer, name: isMaskSelected ? "Fill Mask" : "Fill") { try $0.fill(color) }
+        return await applyPixelEdit(to: layer, name: isMaskSelected ? "Fill Mask" : "Fill") { try $0.fill(color) }
     }
 
     /// Delete with a selection: image pixels become transparent; on a mask the
-    /// selection fills with the background color, as in Photoshop.
-    func clearSelectedPixels() async {
-        guard selection != nil, canEditPixels, let layer = activeLayer else { return }
-        if isMaskSelected { await fillSelection(with: .background); return }
-        guard layer.asset != nil else { return }
-        await applyPixelEdit(to: layer, name: "Clear") { try $0.clearPixels() }
+    /// selection fills with the background color, as in Photoshop. False when nothing could be cleared (no
+    /// selection or pixels to clear) or the clear failed, which it reports.
+    @discardableResult
+    func clearSelectedPixels() async -> Bool {
+        guard selection != nil, canEditPixels, let layer = activeLayer else { return false }
+        if isMaskSelected { return await fillSelection(with: .background) }
+        guard layer.asset != nil else { return false }
+        return await applyPixelEdit(to: layer, name: "Clear") { try $0.clearPixels() }
     }
 
     /// The Delete key: clears the selection when there is one; otherwise deletes the
@@ -112,14 +115,15 @@ extension EditorSession {
                              : ImportedImage(image: result, thumbnail: try PixelInvert.thumbnail(of: result), name: layer.name)
             // Only write over the layer the invert was computed from.
             guard let current = self.document?.layers[safe: index], current.id == layer.id,
-                  current.asset?.image === layer.asset?.image, current.mask?.asset.image === layer.mask?.asset.image else { return }
+                  current.asset?.image === layer.asset?.image, current.mask?.asset.image === layer.mask?.asset.image else {
+                ToolLog.staleResult(mask ? "Invert Mask" : "Invert")
+                return
+            }
             beginEdit(mask ? "Invert Mask" : "Invert")
             if mask {
                 self.document?.layers[index].mask = current.mask.map { $0.replacing(asset) } ?? LayerMask(asset: asset)
             } else {
-                self.document?.layers[index] = ImageLayer(id: current.id, asset: asset, name: current.name,
-                    isVisible: current.isVisible, transform: current.transform, parentID: current.parentID, isGroup: false,
-                    opacity: current.opacity, blendMode: current.blendMode, mask: current.mask, maskSourceID: current.maskSourceID)
+                self.document?.layers[index] = current.replacingPixels(asset, mask: current.mask)
             }
             endEdit()
             brushRevision += 1
@@ -197,14 +201,20 @@ extension EditorSession {
         await finishPixelMove()
     }
 
-    private func applyPixelEdit(to layer: ImageLayer, name: String, _ paint: (BrushStroke) throws -> Void) async {
+    /// True once the edit is on the layer, or when it changes nothing; false when it failed (reported) or the layer
+    /// changed while it was made.
+    private func applyPixelEdit(to layer: ImageLayer, name: String, _ paint: (BrushStroke) throws -> Void) async -> Bool {
         finishOpacityEdit()
         do {
             let edit = try makeRasterEdit(for: layer)
             try paint(edit)
-            guard !edit.patches.isEmpty else { return }
-            try await commitRasterEdit(edit, name: name)
+            guard !edit.patches.isEmpty else { return true }
+            guard try await commitRasterEdit(edit, name: name) else { return false }
             brushRevision += 1
-        } catch { brushError = error.localizedDescription }
+            return true
+        } catch {
+            brushError = error.localizedDescription
+            return false
+        }
     }
 }

@@ -3,16 +3,47 @@ import AppKit
 /// Draws an image into an RGBA buffer (premultiplied, alpha last), lets a C kernel change it in place,
 /// and returns the result.
 nonisolated enum ImageAdjustmentPixels {
-    static func run(_ image: CGImage, _ body: (UnsafeMutablePointer<UInt8>, Int, Int, Int) -> Void) throws -> CGImage {
+    static func run(_ image: CGImage, _ body: (UnsafeMutablePointer<UInt8>, Int, Int, Int) throws -> Void) throws -> CGImage {
         let context = try BrushRaster.context(width: image.width, height: image.height, mask: false)
         BrushRaster.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height), mask: false, context: context)
         guard let data = context.data else { throw ExportError.render }
-        body(data.assumingMemoryBound(to: UInt8.self), image.width, image.height, context.bytesPerRow)
+        try body(data.assumingMemoryBound(to: UInt8.self), image.width, image.height, context.bytesPerRow)
         guard let result = context.makeImage() else { throw ExportError.render }
         return result
     }
+    /// A kernel that returns a status (0 when it finished) and stops when it can't get the memory it works in. Throwing
+    /// keeps a half-applied grade, sharpened up to the step that failed, from being shown or committed as the result.
+    static func check(_ status: Int32) throws {
+        guard status == 0 else { throw ExportError.render }
+    }
     static func clamp(_ value: Double, _ range: ClosedRange<Double>, _ fallback: Double) -> Double {
         value.isFinite ? min(range.upperBound, max(range.lowerBound, value)) : fallback
+    }
+}
+
+nonisolated extension ImageAdjustmentPixels {
+    /// The hue of a straight sRGB color (channels 0…1) in degrees, 0 up to 360, on the usual color hexagon. Colors
+    /// whose chroma is not above `grayChroma` have no hue to speak of and read as 0.
+    static func hueDegrees(red: Double, green: Double, blue: Double, grayChroma: Double = 1e-6) -> Double {
+        let high = max(red, green, blue), chroma = high - min(red, green, blue)
+        guard chroma > grayChroma else { return 0 }
+        let sector: Double
+        if high == red { sector = (green - blue) / chroma }
+        else if high == green { sector = 2 + (blue - red) / chroma }
+        else { sector = 4 + (red - green) / chroma }
+        let degrees = sector * 60
+        return degrees < 0 ? degrees + 360 : degrees
+    }
+
+    /// The straight color of a one-pixel image (a pixel cropped out of a layer), 0…1 per channel; nil when transparent.
+    static func straightColor(of pixel: CGImage) throws -> (red: Double, green: Double, blue: Double)? {
+        let context = try BrushRaster.context(width: 1, height: 1, mask: false)
+        BrushRaster.draw(pixel, in: CGRect(x: 0, y: 0, width: 1, height: 1), mask: false, context: context)
+        guard let data = context.data else { throw ExportError.render }
+        let bytes = data.assumingMemoryBound(to: UInt8.self)
+        guard bytes[3] > 0 else { return nil }
+        let alpha = Double(bytes[3])
+        return (min(1, Double(bytes[0]) / alpha), min(1, Double(bytes[1]) / alpha), min(1, Double(bytes[2]) / alpha))
     }
 }
 
@@ -64,8 +95,8 @@ nonisolated struct ExposureSettings: Codable, Equatable, Sendable {
     func apply(_ image: CGImage) throws -> CGImage {
         guard isValid else { throw ProjectError.invalid }
         let tables = Array([[Float]](repeating: table, count: 3).joined())
-        return try ImageAdjustmentPixels.run(image) { pixels, width, height, _ in
-            levels_apply(pixels, width * height, tables)
+        return try ImageAdjustmentPixels.run(image) { pixels, width, height, stride in
+            levels_apply(pixels, width, height, stride, tables)
         }
     }
 }

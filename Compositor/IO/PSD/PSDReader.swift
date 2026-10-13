@@ -8,31 +8,27 @@ import Foundation
 /// or adapted from GIMP, psd-tools, or any other GPL-licensed PSD reader.
 nonisolated enum PSDReader {
     static func matches(_ url: URL) -> Bool {
-        matches(magicOf: url)
-    }
-
-    private static func matches(magicOf url: URL) -> Bool {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
         defer { try? handle.close() }
         return (try? handle.read(upToCount: 4)) == Data("8BPS".utf8)
     }
 
-    static func matches(_ data: Data) -> Bool {
-        data.count >= 4 && data.prefix(4) == Data("8BPS".utf8)
-    }
-
-    static func read(from url: URL, remainingPixels: Int = 100_000_000) throws -> PSDDocument {
+    /// `remainingPixels` and `remainingMaskPixels` are separate budgets, as a project keeps them: up to
+    /// 100 million image pixels and another 100 million mask pixels (docs/project-format.md).
+    static func read(from url: URL, remainingPixels: Int = 100_000_000,
+                     remainingMaskPixels: Int = 100_000_000) throws -> PSDDocument {
         let data = try Data(contentsOf: url, options: [.mappedIfSafe])
-        return try read(data, remainingPixels: remainingPixels)
+        return try read(data, remainingPixels: remainingPixels, remainingMaskPixels: remainingMaskPixels)
     }
 
-    static func read(_ data: Data, remainingPixels: Int = 100_000_000) throws -> PSDDocument {
+    static func read(_ data: Data, remainingPixels: Int = 100_000_000,
+                     remainingMaskPixels: Int = 100_000_000) throws -> PSDDocument {
         var cursor = PSDCursor(data: data)
         guard try cursor.string(4) == "8BPS" else { throw ImageImportError.unreadable }
         let version = try cursor.u16()
         guard version == 1 else { throw PSDError.unsupportedVersion }
         try cursor.skip(6)
-        _ = try cursor.u16()
+        let channelCount = Int(try cursor.u16())
         let canvasHeight = Int(try cursor.u32())
         let canvasWidth = Int(try cursor.u32())
         let depth = try cursor.u16()
@@ -43,6 +39,7 @@ nonisolated enum PSDReader {
         }
         guard depth == 8 else { throw PSDError.unsupportedDepth }
         guard mode == 3 else { throw PSDError.unsupportedColorMode }
+        guard (3...56).contains(channelCount) else { throw PSDError.truncated }
         try cursor.skip(Int(try cursor.u32()))
         let resourcesLength = Int(try cursor.u32())
         let resourcesEnd = cursor.offset + resourcesLength
@@ -67,26 +64,51 @@ nonisolated enum PSDReader {
         cursor.offset = resourcesEnd
         let layerSection = Int(try cursor.u32())
         let layerSectionEnd = cursor.offset + layerSection
-        guard layerSection >= 4 else {
-            return PSDDocument(width: canvasWidth, height: canvasHeight, resolution: resolution, layers: [])
+        var layers: [PSDRecord] = []
+        if layerSection >= 4 {
+            let layerInfoLength = Int(try cursor.u32())
+            _ = layerInfoLength
+            let rawCount = try cursor.i16()
+            let count = abs(Int(rawCount))
+            guard count <= 10_000 else { throw ImageImportError.tooLarge }
+            var raw = [RawLayer]()
+            raw.reserveCapacity(count)
+            for _ in 0..<count { raw.append(try readRecord(&cursor)) }
+            var usedPixels = 0, usedMaskPixels = 0
+            for index in raw.indices {
+                try decodeChannels(&cursor, layer: &raw[index], remainingPixels: remainingPixels - usedPixels,
+                                   remainingMaskPixels: remainingMaskPixels - usedMaskPixels)
+                if let image = raw[index].image { usedPixels += image.width * image.height }
+                if let mask = raw[index].maskImage { usedMaskPixels += mask.width * mask.height }
+            }
+            layers = try assemble(raw, canvas: CGSize(width: canvasWidth, height: canvasHeight),
+                                  remainingPixels: remainingPixels - usedPixels)
         }
-        let layerInfoLength = Int(try cursor.u32())
-        _ = layerInfoLength
-        let rawCount = try cursor.i16()
-        let count = abs(Int(rawCount))
-        guard count <= 10_000 else { throw ImageImportError.tooLarge }
-        var raw = [RawLayer]()
-        raw.reserveCapacity(count)
-        for _ in 0..<count { raw.append(try readRecord(&cursor)) }
-        var usedPixels = 0
-        for index in raw.indices {
-            try decodeChannels(&cursor, layer: &raw[index], remainingPixels: remainingPixels - usedPixels)
-            if let image = raw[index].image { usedPixels += image.width * image.height }
+        try cursor.seek(layerSectionEnd)
+        // The merged image is never decoded (layers are what's imported), but a file cut short inside
+        // it is still a damaged file, so its extent is checked.
+        try checkImageData(&cursor, channels: channelCount, width: canvasWidth, height: canvasHeight)
+        return PSDDocument(width: canvasWidth, height: canvasHeight, resolution: resolution, layers: layers)
+    }
+
+    /// Confirms the Image Data section is all there: raw planes, or PackBits row counts and the rows they
+    /// promise. ZIP data has no length of its own to check beyond its header.
+    private static func checkImageData(_ cursor: inout PSDCursor, channels: Int, width: Int, height: Int) throws {
+        let compression = try cursor.u16()
+        switch compression {
+        case 0:
+            try cursor.skip(channels * width * height)
+        case 1:
+            let rows = channels * height
+            let counts = try cursor.bytes(rows * 2)
+            var total = 0
+            for row in 0..<rows {
+                total += Int(counts[counts.startIndex + row * 2]) << 8 | Int(counts[counts.startIndex + row * 2 + 1])
+            }
+            try cursor.skip(total)
+        default:
+            break
         }
-        cursor.offset = layerSectionEnd
-        return PSDDocument(width: canvasWidth, height: canvasHeight, resolution: resolution,
-                           layers: try assemble(raw, canvas: CGSize(width: canvasWidth, height: canvasHeight),
-                                                remainingPixels: remainingPixels - usedPixels))
     }
 
     private struct RawLayer {
@@ -167,6 +189,9 @@ nonisolated enum PSDReader {
             } else {
                 length = Int(try cursor.u32())
             }
+            // A block is part of its record: one claiming more than the record has left is damaged. Bounded
+            // only by the file, every one of up to 10,000 records could copy most of the file.
+            guard length <= extraEnd - cursor.offset else { throw PSDError.truncated }
             let payload = try cursor.bytes(length)
             if length % 2 == 1 { try cursor.skip(1) }
             layer.extra[key] = payload
@@ -196,18 +221,20 @@ nonisolated enum PSDReader {
     /// Transparency, R, G, B, and the user mask. Spot and other extra IDs are skipped before decode.
     private static let unpackedChannelIDs: Set<Int> = [-1, 0, 1, 2, -2]
 
-    private static func decodeChannels(_ cursor: inout PSDCursor, layer: inout RawLayer, remainingPixels: Int) throws {
+    private static func decodeChannels(_ cursor: inout PSDCursor, layer: inout RawLayer,
+                                       remainingPixels: Int, remainingMaskPixels: Int) throws {
         var planes: [Int: [UInt8]] = [:]
         let width = max(0, layer.right - layer.left)
         let height = max(0, layer.bottom - layer.top)
         let maskWidth = max(0, layer.maskRight - layer.maskLeft)
         let maskHeight = max(0, layer.maskBottom - layer.maskTop)
-        let budget = max(0, remainingPixels)
         if width > 0, height > 0 {
-            guard width <= 30_000, height <= 30_000, width * height <= budget else { throw ImageImportError.tooLarge }
+            guard width <= 30_000, height <= 30_000, width * height <= max(0, remainingPixels) else {
+                throw ImageImportError.tooLarge
+            }
         }
         if layer.hasMask, maskWidth > 0, maskHeight > 0 {
-            guard maskWidth <= 30_000, maskHeight <= 30_000, maskWidth * maskHeight <= budget else {
+            guard maskWidth <= 30_000, maskHeight <= 30_000, maskWidth * maskHeight <= max(0, remainingMaskPixels) else {
                 throw ImageImportError.tooLarge
             }
         }
@@ -240,20 +267,33 @@ nonisolated enum PSDReader {
         layer.image = try PSDChannelCoder.rgbaImage(width: width, height: height, red: red, green: green, blue: blue, alpha: alpha)
     }
 
+    /// Folders a project can nest (see `LayerHierarchy.validate`): a folder may have at most 63 folders
+    /// above it, so that a layer inside it still fits under the 64-ancestor limit.
+    static let maximumFolderDepth = 64
+
     private static func assemble(_ raw: [RawLayer], canvas: CGSize, remainingPixels: Int) throws -> [PSDRecord] {
         var result: [PSDRecord] = []
+        // The folders the next record sits in, outermost first. Those past `maximumFolderDepth` are
+        // dissolved: what they hold goes into the deepest folder that fits.
         var groups: [UUID] = []
+        var dissolved = Set<UUID>()
+        // The folder each record was actually in, dissolved or not.
+        var containers: [UUID?] = []
         var remaining = max(0, remainingPixels)
         for layer in raw {
             // Photoshop stores groups bottom-to-top: type 3 divider, then children, then the folder (type 1/2).
             if layer.section == 3 {
-                groups.append(UUID())
+                let id = UUID()
+                if groups.count >= maximumFolderDepth { dissolved.insert(id) }
+                groups.append(id)
                 continue
             }
             let isGroup = layer.section == 1 || layer.section == 2
             let id = isGroup ? (groups.popLast() ?? UUID()) : UUID()
-            var record = PSDRecord(id: id, name: layer.name.isEmpty ? "Layer" : layer.name)
-            record.parentID = groups.last
+            var record = PSDRecord(id: id, name: layerName(layer.name, fallback: isGroup ? "Group" : "Layer"))
+            record.parentID = groups.prefix(maximumFolderDepth).last
+            record.isDissolved = dissolved.contains(id)
+            containers.append(groups.last)
             record.isGroup = isGroup
             record.isVisible = !layer.hidden
             record.blendKey = isGroup && (layer.blendKey == "pass" || layer.blendKey == "norm") ? "pass" : layer.blendKey
@@ -291,7 +331,44 @@ nonisolated enum PSDReader {
             result.append(record)
         }
         guard groups.isEmpty else { throw PSDError.truncated }
+        guard !dissolved.isEmpty else { return result }
+        // What a dissolved folder did to its layers is carried onto them: hidden stays hidden, and its
+        // opacity multiplies in, as it would have (see LayerOpacity). Walking top to bottom meets every
+        // folder before what it holds.
+        var carried: [UUID: (opacity: Double, isVisible: Bool)] = [:]
+        for index in result.indices.reversed() {
+            var opacity = result[index].opacity, isVisible = result[index].isVisible
+            if let container = containers[index], let outer = carried[container] {
+                opacity *= outer.opacity
+                isVisible = isVisible && outer.isVisible
+            }
+            if result[index].isDissolved {
+                carried[result[index].id] = (opacity, isVisible)
+            } else {
+                result[index].opacity = opacity
+                result[index].isVisible = isVisible
+            }
+        }
         return result
+    }
+
+    /// A name a project can keep: not blank, and at most 16 KiB of UTF-8, cut between characters.
+    static func layerName(_ name: String, fallback: String) -> String {
+        let limit = 16_384
+        var kept = name
+        if name.utf8.count > limit {
+            var bytes = 0
+            var end = name.startIndex
+            for index in name.indices {
+                let next = name.index(after: index)
+                let size = name.utf8.distance(from: index, to: next)
+                guard bytes + size <= limit else { break }
+                bytes += size
+                end = next
+            }
+            kept = String(name[..<end])
+        }
+        return kept.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? fallback : kept
     }
 
     private static func kind(_ layer: RawLayer, isGroup: Bool) -> PSDLayerKind {
@@ -318,8 +395,16 @@ nonisolated private struct PSDCursor: Sendable {
     let data: Data
     var offset = 0
 
+    /// Subtracts rather than adds: a length read from the file can be as large as `Int.max`
+    /// (8B64 blocks), and `offset + count` would trap instead of reporting a truncated file.
     mutating func need(_ count: Int) throws {
-        guard offset >= 0, offset + count <= data.count else { throw PSDError.truncated }
+        guard offset >= 0, offset <= data.count, count >= 0, count <= data.count - offset else { throw PSDError.truncated }
+    }
+
+    /// Moves to an absolute offset read from the file, which must lie within it.
+    mutating func seek(_ target: Int) throws {
+        guard target >= 0, target <= data.count else { throw PSDError.truncated }
+        offset = target
     }
 
     mutating func skip(_ count: Int) throws {
@@ -366,7 +451,8 @@ nonisolated enum PSDAdjustments {
     static func parse(_ extra: [String: Data]) -> LayerAdjustment? {
         if let data = extra["levl"] { return levels(data) }
         if let data = extra["curv"] { return curves(data) }
-        if let data = extra["hue2"] ?? extra["hue "] { return hue(data) }
+        if let data = extra["hue2"] { return hue(data, legacy: false) }
+        if let data = extra["hue "] { return hue(data, legacy: true) }
         return nil
     }
 
@@ -379,7 +465,8 @@ nonisolated enum PSDAdjustments {
             let inputWhite = Double(u16(data, base + 2))
             let outputBlack = Double(u16(data, base + 4))
             let outputWhite = Double(u16(data, base + 6))
-            let gamma = Double(u16(data, base + 8)) / 256
+            // Photoshop stores gamma × 100: 10…999 for 0.1…9.99.
+            let gamma = Double(u16(data, base + 8)) / 100
             settings.ranges[channel] = LevelRange(black: inputBlack, gamma: gamma, white: inputWhite,
                                                   outputBlack: outputBlack, outputWhite: outputWhite).normalized
         }
@@ -421,19 +508,45 @@ nonisolated enum PSDAdjustments {
         return LayerAdjustment(kind: .curves, curves: settings)
     }
 
-    private static func hue(_ data: Data) -> LayerAdjustment? {
-        guard data.count >= 4 else { return nil }
+    /// Adobe's Hue/Saturation layout: version (2), a colorize flag and a pad byte, the colorize values at 4,
+    /// Master at 10, then Reds through Magentas at 16, 14 bytes each: four band handles in degrees
+    /// (falloff start, range start, range end, falloff end) and the range's hue, saturation and lightness.
+    private static func hue(_ data: Data, legacy: Bool) -> LayerAdjustment? {
+        guard data.count >= 16, legacy || u16(data, 0) == 2 else { return nil }
         let colorize = data[2] != 0
         var settings = HueSaturationSettings(colorize: colorize)
-        let ranges = [ColorRange.master, .reds, .yellows, .greens, .cyans, .blues, .magentas]
-        var offset = 4
-        for range in ranges {
-            guard offset + 6 <= data.count else { break }
-            let hue = i16(data, offset)
-            let saturation = i16(data, offset + 2)
-            let lightness = i16(data, offset + 4)
-            offset += 6
-            settings.adjustments[range] = RangeAdjustment(hue: Double(hue), saturation: Double(saturation), lightness: Double(lightness))
+        // Photoshop's own ranges; a damaged value outside them would make the layer unsaveable.
+        func values(at offset: Int) -> RangeAdjustment {
+            RangeAdjustment(hue: min(180, max(-180, Double(i16(data, offset)))),
+                            saturation: min(100, max(-100, Double(i16(data, offset + 2)))),
+                            lightness: min(100, max(-100, Double(i16(data, offset + 4)))))
+        }
+        if colorize {
+            // Colorize ignores Master and the ranges. Photoshop 4 ("hue ") kept these values as −100…100;
+            // Photoshop 5 ("hue2") keeps hue −180…180 and saturation 0…100. Colorize here takes hue 0…360.
+            var tint = values(at: 4)
+            if legacy {
+                tint.hue *= 1.8
+                tint.saturation = (tint.saturation + 100) / 2
+            }
+            tint.saturation = max(0, tint.saturation)
+            if tint.hue < 0 { tint.hue += 360 }
+            settings.adjustments[.master] = tint
+            return LayerAdjustment(kind: .hsv, hsvSettings: settings)
+        }
+        settings.adjustments[.master] = values(at: 10)
+        for (index, range) in ColorRange.colorRanges.enumerated() {
+            let offset = 16 + index * 14
+            guard offset + 14 <= data.count else { break }
+            let handles = (0..<4).map { Double(i16(data, offset + $0 * 2)) }
+            // Handles wrap around the color wheel, so Reds may run from 315 through 0 to 45 (or -45 to 45).
+            let wrapped = handles.map { value in
+                let degrees = value.truncatingRemainder(dividingBy: 360)
+                return degrees < 0 ? degrees + 360 : degrees
+            }
+            settings.bands[range] = HueBand(falloffStart: wrapped[0], rangeStart: wrapped[1],
+                                            rangeEnd: wrapped[2], falloffEnd: wrapped[3])
+            settings.adjustments[range] = values(at: offset + 8)
         }
         return LayerAdjustment(kind: .hsv, hsvSettings: settings)
     }

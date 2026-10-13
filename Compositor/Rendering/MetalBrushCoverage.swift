@@ -1,16 +1,29 @@
 import AppKit
 import Metal
+import os
 
 /// Shared pipeline, with stroke-local tile storage. No full-canvas GPU allocation.
 final class MetalBrushCoverage {
-    static let shared: MetalBrushCoverage? = try? MetalBrushCoverage()
+    static let shared: MetalBrushCoverage? = {
+        do { return try MetalBrushCoverage() } catch {
+            // The CPU path gives the same pixels, only slower; say so, or a slow machine has no explanation.
+            Logger.compositor("Tools").error("Brush coverage renders on the CPU: Metal is unavailable (\(String(describing: error), privacy: .public))")
+            return nil
+        }
+    }()
     private let device: MTLDevice
     private let queue: MTLCommandQueue
     private let pipeline: MTLComputePipelineState
 
+    /// A tile's accumulated paint, kept on the GPU for the whole stroke.
     struct Tile {
         let permanent: MTLBuffer
-        let preview: MTLBuffer
+    }
+    /// Encoded, uncommitted work: where each tile's preview coverage will be in `staging` once it has run.
+    struct Batch {
+        let command: MTLCommandBuffer
+        let staging: MTLBuffer
+        let copies: [(offset: Int, count: Int, context: CGContext)]
     }
     private struct Uniforms {
         var mapping: SIMD4<Float>
@@ -26,23 +39,35 @@ final class MetalBrushCoverage {
         pipeline = try device.makeComputePipelineState(function: function)
     }
     func tile(width: Int, height: Int) throws -> Tile {
-        guard let permanent = device.makeBuffer(length: width * height * MemoryLayout<Float>.stride, options: .storageModeShared),
-              let preview = device.makeBuffer(length: width * height, options: .storageModeShared) else { throw ExportError.render }
+        guard let permanent = device.makeBuffer(length: width * height * MemoryLayout<Float>.stride, options: .storageModeShared) else { throw ExportError.render }
         memset(permanent.contents(), 0, width * height * MemoryLayout<Float>.stride)
-        return Tile(permanent: permanent, preview: preview)
+        return Tile(permanent: permanent)
     }
-    func render(_ tiles: [(Tile, CGRect, CGContext)], settled: [SIMD4<Float>], tail: [SIMD4<Float>],
-                mapping: CGAffineTransform, settings: BrushSettings, canvas: CGSize) throws {
-        guard !tiles.isEmpty else { return }
+
+    /// Encodes one brush event over `tiles`. Each batch writes its preview into staging of its own, so a batch
+    /// still being read back is never overwritten by the next; the permanent paint is shared, and Metal orders
+    /// those writes by commit order on the one queue.
+    func encode(_ tiles: [(Tile, CGRect, CGContext)], settled: [SIMD4<Float>], tail: [SIMD4<Float>],
+                mapping: CGAffineTransform, settings: BrushSettings, canvas: CGSize) throws -> Batch? {
+        guard !tiles.isEmpty else { return nil }
         // A dummy segment supplies a valid buffer for tail removal with no new geometry.
         let segments = settled + tail
         let storage = segments.isEmpty ? [SIMD4<Float>(repeating: 0)] : segments
+        // Offsets kept to 256 bytes, which every Metal device accepts for a buffer binding.
+        var copies: [(offset: Int, count: Int, context: CGContext)] = []
+        var length = 0
+        for (_, rect, context) in tiles {
+            let count = Int(rect.width * rect.height)
+            copies.append((length, count, context))
+            length += (count + 255) / 256 * 256
+        }
         guard let buffer = storage.withUnsafeBytes({ bytes in
             device.makeBuffer(bytes: bytes.baseAddress!, length: bytes.count, options: .storageModeShared)
-        }), let command = queue.makeCommandBuffer(), let encoder = command.makeComputeCommandEncoder() else { throw ExportError.render }
+        }), let staging = device.makeBuffer(length: max(1, length), options: .storageModeShared),
+              let command = queue.makeCommandBuffer(), let encoder = command.makeComputeCommandEncoder() else { throw ExportError.render }
         encoder.setComputePipelineState(pipeline)
         encoder.setBuffer(buffer, offset: 0, index: 3)
-        for (tile, rect, _) in tiles {
+        for ((tile, rect, _), copy) in zip(tiles, copies) {
             let origin = rect.origin.applying(mapping)
             var uniforms = Uniforms(
                 mapping: SIMD4(Float(mapping.a), Float(mapping.b), Float(mapping.c), Float(mapping.d)),
@@ -50,19 +75,22 @@ final class MetalBrushCoverage {
                 canvas: SIMD4(Float(canvas.width), Float(canvas.height), Float(max(0.001, min(hypot(mapping.a, mapping.b), hypot(mapping.c, mapping.d)))), Float(max(0.25, settings.diameter * BrushStroke.spacingFraction(settings.hardness)))),
                 counts: SIMD4(UInt32(rect.width), UInt32(rect.height), UInt32(settled.count), UInt32(segments.count)))
             encoder.setBuffer(tile.permanent, offset: 0, index: 0)
-            encoder.setBuffer(tile.preview, offset: 0, index: 1)
+            encoder.setBuffer(staging, offset: copy.offset, index: 1)
             encoder.setBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 2)
             encoder.dispatchThreads(MTLSize(width: Int(rect.width), height: Int(rect.height), depth: 1),
                                     threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
         }
         encoder.endEncoding()
-        command.commit()
-        command.waitUntilCompleted()
-        guard command.status == .completed else { throw command.error ?? ExportError.render }
-        for (tile, rect, context) in tiles {
+        return Batch(command: command, staging: staging, copies: copies)
+    }
+
+    /// Copies a finished batch's coverage out of its staging buffer.
+    static func deliver(_ batch: Batch) throws {
+        guard batch.command.status == .completed else { throw batch.command.error ?? ExportError.render }
+        for copy in batch.copies {
             // CGContext owns its memory so makeImage's copy-on-write snapshots stay immutable.
-            guard let destination = context.data else { throw ExportError.render }
-            memcpy(destination, tile.preview.contents(), Int(rect.width * rect.height))
+            guard let destination = copy.context.data else { throw ExportError.render }
+            memcpy(destination, batch.staging.contents().advanced(by: copy.offset), copy.count)
         }
     }
 
@@ -159,4 +187,52 @@ kernel void continuousBrush(device float *permanent [[buffer(0)]],
     }
 }
 """
+}
+
+/// One stroke's GPU work, handed on in the order it was asked for. A drag event commits its batch and returns;
+/// the batch's coverage is copied out on the main thread once it and every batch before it have finished, so
+/// results land in order and come out the same as waiting for each one would.
+final class BrushCoverageQueue {
+    private let gpu: MetalBrushCoverage
+    /// In commit order. An event that touched no tiles has no batch, but still waits its turn.
+    private var pending: [(batch: MetalBrushCoverage.Batch?, apply: () throws -> Void)] = []
+    /// The first failure, kept for the next submit or settle to report: a stroke missing a batch would be wrong.
+    private var failure: (any Error)?
+
+    init(gpu: MetalBrushCoverage) { self.gpu = gpu }
+
+    /// Commits one brush event. `apply` runs on the main thread after its coverage is in the tiles' contexts.
+    func submit(_ tiles: [(MetalBrushCoverage.Tile, CGRect, CGContext)], settled: [SIMD4<Float>], tail: [SIMD4<Float>],
+                mapping: CGAffineTransform, settings: BrushSettings, canvas: CGSize, apply: @escaping () throws -> Void) throws {
+        if let failure { throw failure }
+        let batch = try gpu.encode(tiles, settled: settled, tail: tail, mapping: mapping, settings: settings, canvas: canvas)
+        pending.append((batch, apply))
+        guard let batch else { land(); return }
+        batch.command.addCompletedHandler { [weak self] _ in
+            Task { @MainActor in self?.land() }
+        }
+        batch.command.commit()
+    }
+
+    /// Waits for everything committed so far and hands it on. For the end of a stroke, and for callers that read
+    /// the stroke's pixels straight after painting.
+    func settle() throws {
+        while let first = pending.first {
+            first.batch?.command.waitUntilCompleted()
+            land()
+        }
+        if let failure { throw failure }
+    }
+
+    /// Hands on the finished batches at the front of the line; one still running holds back those after it.
+    private func land() {
+        while let first = pending.first, first.batch.map({ $0.command.status == .completed || $0.command.status == .error }) ?? true {
+            pending.removeFirst()
+            guard failure == nil else { continue }
+            do {
+                if let batch = first.batch { try MetalBrushCoverage.deliver(batch) }
+                try first.apply()
+            } catch { failure = error }
+        }
+    }
 }

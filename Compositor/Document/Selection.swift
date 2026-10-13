@@ -4,6 +4,8 @@ import CoreImage
 /// A document-space selection outline, clipped to the canvas. `nil` on the document
 /// means no selection; a selection whose path is empty is an explicit empty selection,
 /// which later edits must treat as "touch nothing", never as "touch everything".
+/// Unchecked only because CGPath isn't marked Sendable: `path` is a `let`, and no path is mutated once it has been
+/// handed to a selection — every edit builds a new one.
 nonisolated struct DocumentSelection: Equatable, @unchecked Sendable {
     let path: CGPath
     var antialiased = true
@@ -50,7 +52,7 @@ extension DocumentSelection {
 
 /// Selection coverage for one region of the document. Applied as a clip, soft edges
 /// blend partially; with no coverage (an empty selection) it clips everything away.
-nonisolated struct SelectionClip: @unchecked Sendable {
+nonisolated struct SelectionClip: Sendable {
     let rect: CGRect
     let coverage: CGImage?
 

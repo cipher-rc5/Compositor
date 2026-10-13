@@ -144,4 +144,24 @@ struct MagicWandTests {
         #expect(session.selection != nil)
         #expect(try pixels(session.selection?.path, width: 20, height: 10) == left)
     }
+
+    /// `Int(_:)` traps on NaN and infinity, so a non-finite point must be turned away before any conversion:
+    /// directly, and through the session's click.
+    @Test func aNonFinitePointSelectsNothingAndDoesNotTrap() async throws {
+        let image = try image(width: 20, height: 10) { _, _ in red }
+        let strange: [CGPoint] = [CGPoint(x: CGFloat.nan, y: 5), CGPoint(x: 5, y: CGFloat.nan), CGPoint(x: CGFloat.infinity, y: 5),
+                                  CGPoint(x: 5, y: -CGFloat.infinity), CGPoint(x: -CGFloat.infinity, y: CGFloat.infinity)]
+        for point in strange {
+            #expect(try MagicWand.select(in: image, at: point, settings: settings()) == nil, "\(point)")
+        }
+        let session = EditorSession()
+        session.createDocument(width: 20, height: 10)
+        session.insert(ImportedImage(image: image, thumbnail: image, name: "Red"))
+        session.applySelection(CGPath(rect: CGRect(x: 2, y: 2, width: 4, height: 4), transform: nil), mode: .replace, name: "Select")
+        let selection = session.selection, count = session.history.undoCount
+        for point in strange {
+            for mode in [SelectionMode.replace, .add, .subtract] { await session.magicWand(at: point, mode: mode) }
+        }
+        #expect(session.selection == selection && session.history.undoCount == count && !session.isProjectBusy)
+    }
 }

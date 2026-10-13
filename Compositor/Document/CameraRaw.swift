@@ -1,4 +1,5 @@
 import AppKit
+import os
 
 /// White balance on an already-rendered layer. Raw lighting presets are absent: temperature and tint
 /// are relative offsets, not kelvin.
@@ -246,13 +247,14 @@ nonisolated struct CameraRawSettings: Equatable, Sendable {
             if paintColor { settings.applyCurveColor(pixels, width: width, height: height, stride: stride, visualize: visualizePointColor) }
             if paintEffects {
                 if settings.texture != 0 || settings.clarity != 0 || settings.dehaze != 0 || settings.glow != 0 || settings.vignetteAmount != 0 {
-                    adjust_camera_raw_effects(pixels, width, height, stride,
-                                              settings.texture, settings.clarity, settings.dehaze,
-                                              settings.glow, settings.glowStyle.kernelValue, settings.glowRange,
-                                              settings.glowSpread, settings.glowWarmth,
-                                              settings.vignetteAmount, settings.vignetteMidpoint, settings.vignetteRoundness,
-                                              settings.vignetteFeather, settings.vignetteHighlights, settings.vignetteStyle.kernelValue,
-                                              pixelScale)
+                    let status = adjust_camera_raw_effects(pixels, width, height, stride,
+                                                           settings.texture, settings.clarity, settings.dehaze,
+                                                           settings.glow, settings.glowStyle.kernelValue, settings.glowRange,
+                                                           settings.glowSpread, settings.glowWarmth,
+                                                           settings.vignetteAmount, settings.vignetteMidpoint, settings.vignetteRoundness,
+                                                           settings.vignetteFeather, settings.vignetteHighlights, settings.vignetteStyle.kernelValue,
+                                                           pixelScale)
+                    try ImageAdjustmentPixels.check(status)
                 }
                 if settings.grainAmount > 0 {
                     adjust_grain(pixels, width, height, stride, settings.grainAmount, settings.grainKernelSize,
@@ -260,7 +262,7 @@ nonisolated struct CameraRawSettings: Equatable, Sendable {
                 }
             }
             if paintDetailOptics {
-                settings.applyDetailOptics(pixels: pixels, width: width, height: height, stride: stride, scale: pixelScale,
+                try settings.applyDetailOptics(pixels: pixels, width: width, height: height, stride: stride, scale: pixelScale,
                                            profileStrength: PixelFilter.lensStrength, sharpenMask: sharpenMask)
             }
         }
@@ -288,9 +290,13 @@ nonisolated struct CameraRawSettings: Equatable, Sendable {
         neutralize(linearRed: decode(red), green: decode(green), blue: decode(blue))
     }
 
+    /// Auto white balance reads a copy no larger than this on its longest side: an average over a quarter million
+    /// pixels is as good as one over every pixel of a large layer, and far quicker to draw and add up.
+    static let autoBalanceLimit = 512
+
     /// Gray-world balance of the opaque pixels. Nil when the image has no coverage or no solution.
-    static func autoBalance(of image: CGImage) -> (temperature: Double, tint: Double)? {
-        guard let average = averageLinear(image) else { return nil }
+    static func autoBalance(of image: CGImage) throws -> (temperature: Double, tint: Double)? {
+        guard let average = try averageLinear(image) else { return nil }
         return neutralize(linearRed: average.red, green: average.green, blue: average.blue)
     }
 
@@ -298,28 +304,18 @@ nonisolated struct CameraRawSettings: Equatable, Sendable {
         encoded <= 0.04045 ? encoded / 12.92 : pow((encoded + 0.055) / 1.055, 2.4)
     }
 
-    private static func averageLinear(_ image: CGImage) -> (red: Double, green: Double, blue: Double)? {
+    /// Mean linear-light color of the pixels with alpha, from a copy at most `autoBalanceLimit` pixels on a side.
+    static func averageLinear(_ image: CGImage) throws -> (red: Double, green: Double, blue: Double)? {
         guard image.width > 0, image.height > 0 else { return nil }
-        let context = try? BrushRaster.context(width: image.width, height: image.height, mask: false)
-        guard let context else { return nil }
-        BrushRaster.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height), mask: false, context: context)
-        guard let data = context.data else { return nil }
-        let bytes = data.assumingMemoryBound(to: UInt8.self)
-        var red = 0.0, green = 0.0, blue = 0.0, count = 0.0
-        for y in 0..<image.height {
-            let row = y * context.bytesPerRow
-            for x in 0..<image.width {
-                let pixel = row + x * 4
-                let alpha = Double(bytes[pixel + 3])
-                if alpha == 0 { continue }
-                red += decode(min(1, Double(bytes[pixel]) / alpha))
-                green += decode(min(1, Double(bytes[pixel + 1]) / alpha))
-                blue += decode(min(1, Double(bytes[pixel + 2]) / alpha))
-                count += 1
-            }
-        }
+        let factor = min(1, Double(autoBalanceLimit) / Double(max(image.width, image.height)))
+        let width = max(1, Int(Double(image.width) * factor)), height = max(1, Int(Double(image.height) * factor))
+        let context = try BrushRaster.context(width: width, height: height, mask: false)
+        BrushRaster.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height), mask: false, context: context)
+        guard let data = context.data else { throw ExportError.render }
+        var average = [Double](repeating: 0, count: 3)
+        let count = camera_raw_average_linear(data.assumingMemoryBound(to: UInt8.self), width, height, context.bytesPerRow, &average)
         guard count > 0 else { return nil }
-        return (red / count, green / count, blue / count)
+        return (average[0], average[1], average[2])
     }
 }
 
@@ -333,6 +329,8 @@ nonisolated enum CameraRawScopeMode: String, Sendable {
 nonisolated struct CameraRawScope: Equatable, Sendable {
     static let binCount = 256
     static let scopeSide = 64
+    /// Most pixels the vectorscope counts; larger images are sampled on a grid.
+    static let scopeSamples = 512 * 512
     var red: [Double]
     var green: [Double]
     var blue: [Double]
@@ -354,37 +352,12 @@ nonisolated struct CameraRawScope: Equatable, Sendable {
         guard let data = context.data else { return nil }
         let bytes = data.assumingMemoryBound(to: UInt8.self)
         var bins = Array(repeating: 0.0, count: binCount * 4)
-        levels_histogram(bytes, nil, image.width * image.height, &bins)
+        levels_histogram(bytes, image.width, image.height, context.bytesPerRow, nil, 0, &bins)
+        // The scope is 64 cells across, so a quarter million samples fill it as well as every pixel would; a full-size
+        // preview counts every fourth pixel of every fourth row.
+        let step = max(1, Int((Double(image.width * image.height) / Double(scopeSamples)).squareRoot().rounded(.up)))
         var scope = Array(repeating: 0.0, count: scopeSide * scopeSide)
-        let stride = context.bytesPerRow
-        for y in 0..<image.height {
-            let row = y * stride
-            for x in 0..<image.width {
-                let pixel = row + x * 4
-                let alpha = Double(bytes[pixel + 3])
-                if alpha == 0 { continue }
-                let red = min(1, Double(bytes[pixel]) / alpha)
-                let green = min(1, Double(bytes[pixel + 1]) / alpha)
-                let blue = min(1, Double(bytes[pixel + 2]) / alpha)
-                let maxChannel = max(red, green, blue)
-                let minChannel = min(red, green, blue)
-                let chroma = maxChannel - minChannel
-                guard chroma > 1e-4, maxChannel > 1e-4 else { continue }
-                var hue: Double
-                if maxChannel == red { hue = (green - blue) / chroma }
-                else if maxChannel == green { hue = 2 + (blue - red) / chroma }
-                else { hue = 4 + (red - green) / chroma }
-                hue = hue / 6
-                if hue < 0 { hue += 1 }
-                let angle = hue * 2 * Double.pi
-                let saturation = chroma / maxChannel
-                let plotX = 0.5 + cos(angle) * saturation * 0.48
-                let plotY = 0.5 + sin(angle) * saturation * 0.48
-                let column = min(scopeSide - 1, max(0, Int(plotX * Double(scopeSide))))
-                let rowIndex = min(scopeSide - 1, max(0, Int(plotY * Double(scopeSide))))
-                scope[rowIndex * scopeSide + column] += alpha / 255
-            }
-        }
+        levels_vectorscope(bytes, image.width, image.height, context.bytesPerRow, step, Int32(scopeSide), &scope)
         return Self(red: Array(bins[256..<512]), green: Array(bins[512..<768]), blue: Array(bins[768..<1024]), vectorscope: scope)
     }
 
@@ -405,8 +378,11 @@ nonisolated struct CameraRawScope: Equatable, Sendable {
         grade.visualizesPointColor = -1
         grade.showsSharpenMask = false
         let graded = try PixelFilter.run(grade)
+        // Checked between the stages: a preview superseded mid-render stops instead of counting and painting for nothing.
+        try Task.checkCancellation()
         let scope = make(graded) ?? Self(red: Array(repeating: 0, count: binCount), green: Array(repeating: 0, count: binCount),
                                          blue: Array(repeating: 0, count: binCount), vectorscope: Array(repeating: 0, count: scopeSide * scopeSide))
+        try Task.checkCancellation()
         if job.cameraRawClipping != nil || job.showsSharpenMask { return (try PixelFilter.run(job), scope) }
         if job.showsShadowClipping || job.showsHighlightClipping {
             return (try overlay(graded, shadows: job.showsShadowClipping, highlights: job.showsHighlightClipping), scope)
@@ -425,13 +401,8 @@ extension EditorSession {
         guard pixel.x >= 0, pixel.y >= 0, pixel.x < CGFloat(edit.original.image.width),
               pixel.y < CGFloat(edit.original.image.height), let sample = edit.original.image.cropping(to: rect) else { return }
         do {
-            let context = try BrushRaster.context(width: 1, height: 1, mask: false)
-            BrushRaster.draw(sample, in: CGRect(x: 0, y: 0, width: 1, height: 1), mask: false, context: context)
-            guard let data = context.data else { return }
-            let bytes = data.assumingMemoryBound(to: UInt8.self)
-            guard bytes[3] > 0 else { return }
-            let rgb = (0..<3).map { min(1, Double(bytes[$0]) / Double(bytes[3])) }
-            guard let solved = CameraRawSettings.neutralize(straightRed: rgb[0], green: rgb[1], blue: rgb[2]) else { return }
+            guard let rgb = try ImageAdjustmentPixels.straightColor(of: sample),
+                  let solved = CameraRawSettings.neutralize(straightRed: rgb.red, green: rgb.green, blue: rgb.blue) else { return }
             var settings = edit.settings
             settings.cameraRaw.temperature = solved.temperature
             settings.cameraRaw.tint = solved.tint
@@ -441,21 +412,42 @@ extension EditorSession {
     }
 
     /// White Balance > Auto. The mode is stored before the scan, so the picker moves on the click.
-    /// The average of the original layer is taken off the main thread, then applied only if Auto is still selected.
+    /// The average of the original layer is taken off the main thread, on a copy no larger than `autoBalanceLimit`,
+    /// then applied only if Auto is still selected. Closing the panel, or choosing Auto again, cancels the scan.
     func applyCameraRawAutoWhiteBalance() async {
         guard let edit = filterEdit, edit.kind == .cameraRaw, !edit.committing else { return }
         var settings = edit.settings
         settings.cameraRaw.whiteBalance = .auto
         updateFilter(settings, preview: edit.preview)
         let image = edit.original.image
-        let solved = await Task.detached(priority: .userInitiated) {
-            CameraRawSettings.autoBalance(of: image)
-        }.value
-        guard filterEdit === edit, !edit.committing, edit.settings.cameraRaw.whiteBalance == .auto, let solved else { return }
-        settings = edit.settings
-        settings.cameraRaw.temperature = solved.temperature
-        settings.cameraRaw.tint = solved.tint
-        updateFilter(settings, preview: edit.preview)
+        edit.whiteBalanceTask?.cancel()
+        let task = Task { @MainActor [weak self, weak edit] in
+            let solved: (temperature: Double, tint: Double)?
+            do {
+                solved = try await PixelAdjust.detached {
+                    try Task.checkCancellation()
+                    return try CameraRawSettings.autoBalance(of: image)
+                }
+            } catch is CancellationError {
+                return // The panel closed or a newer scan took over; nothing is waiting for this one.
+            } catch {
+                self?.brushError = error.localizedDescription
+                return
+            }
+            guard let self, let edit, self.filterEdit === edit, !edit.committing, !Task.isCancelled,
+                  edit.settings.cameraRaw.whiteBalance == .auto else {
+                adjustmentLog.notice("Auto white balance finished after the panel moved on; its result was discarded")
+                return
+            }
+            guard let solved else { return }
+            var settings = edit.settings
+            settings.cameraRaw.temperature = solved.temperature
+            settings.cameraRaw.tint = solved.tint
+            self.updateFilter(settings, preview: edit.preview)
+        }
+        edit.whiteBalanceTask = task
+        await task.value
+        if edit.whiteBalanceTask == task { edit.whiteBalanceTask = nil }
     }
 
     /// Defringe eyedropper: centers the purple or green hue range on the clicked fringe color.
@@ -467,15 +459,8 @@ extension EditorSession {
         guard pixel.x >= 0, pixel.y >= 0, pixel.x < CGFloat(edit.original.image.width),
               pixel.y < CGFloat(edit.original.image.height), let sample = edit.original.image.cropping(to: rect) else { return }
         do {
-            let context = try BrushRaster.context(width: 1, height: 1, mask: false)
-            BrushRaster.draw(sample, in: CGRect(x: 0, y: 0, width: 1, height: 1), mask: false, context: context)
-            guard let data = context.data else { return }
-            let bytes = data.assumingMemoryBound(to: UInt8.self)
-            guard bytes[3] > 0 else { return }
-            let r = min(1, Double(bytes[0]) / Double(bytes[3]))
-            let g = min(1, Double(bytes[1]) / Double(bytes[3]))
-            let b = min(1, Double(bytes[2]) / Double(bytes[3]))
-            let hue = Self.hueDegrees(red: r, green: g, blue: b)
+            guard let rgb = try ImageAdjustmentPixels.straightColor(of: sample) else { return }
+            let hue = ImageAdjustmentPixels.hueDegrees(red: rgb.red, green: rgb.green, blue: rgb.blue)
             var settings = edit.settings
             let purpleCenter = 290.0, greenCenter = 90.0
             let span = 25.0
@@ -491,19 +476,6 @@ extension EditorSession {
             settings.cameraRaw.optics = settings.cameraRaw.optics.normalized
             updateFilter(settings, preview: edit.preview)
         } catch { brushError = error.localizedDescription }
-    }
-
-    private static func hueDegrees(red: Double, green: Double, blue: Double) -> Double {
-        let maxc = max(red, green, blue), minc = min(red, green, blue)
-        let chroma = maxc - minc
-        guard chroma > 1e-6 else { return 0 }
-        let hue: Double
-        if maxc == red { hue = (green - blue) / chroma }
-        else if maxc == green { hue = 2 + (blue - red) / chroma }
-        else { hue = 4 + (red - green) / chroma }
-        var degrees = hue * 60
-        if degrees < 0 { degrees += 360 }
-        return degrees
     }
 
     /// RGB under the pointer while Camera Raw is open. Outside the layer clears the readout.
@@ -612,27 +584,16 @@ extension EditorSession {
         let pixel = point.applying(edit.previewMapping.inverted())
         let rect = CGRect(x: floor(pixel.x), y: floor(pixel.y), width: 1, height: 1)
         guard pixel.x >= 0, pixel.y >= 0, pixel.x < CGFloat(image.width), pixel.y < CGFloat(image.height),
-              let sample = image.cropping(to: rect),
-              let context = try? BrushRaster.context(width: 1, height: 1, mask: false) else { return nil }
-        BrushRaster.draw(sample, in: CGRect(x: 0, y: 0, width: 1, height: 1), mask: false, context: context)
-        guard let data = context.data else { return nil }
-        let bytes = data.assumingMemoryBound(to: UInt8.self)
-        guard bytes[3] > 0 else { return nil }
-        let red = min(1, Double(bytes[0]) / Double(bytes[3]))
-        let green = min(1, Double(bytes[1]) / Double(bytes[3]))
-        let blue = min(1, Double(bytes[2]) / Double(bytes[3]))
+              let sample = image.cropping(to: rect) else { return nil }
+        let color: (red: Double, green: Double, blue: Double)?
+        do { color = try ImageAdjustmentPixels.straightColor(of: sample) } catch { brushError = error.localizedDescription; return nil }
+        guard let color else { return nil }
+        let (red, green, blue) = color
         let maxChannel = max(red, green, blue), minChannel = min(red, green, blue)
         let chroma = maxChannel - minChannel
-        var hue = 0.0
-        if chroma > 1e-6 {
-            if maxChannel == red { hue = (green - blue) / chroma }
-            else if maxChannel == green { hue = 2 + (blue - red) / chroma }
-            else { hue = 4 + (red - green) / chroma }
-            hue /= 6
-            if hue < 0 { hue += 1 }
-        }
+        let hue = ImageAdjustmentPixels.hueDegrees(red: red, green: green, blue: blue)
         let tone = 0.2126 * red + 0.7152 * green + 0.0722 * blue
         let saturation = maxChannel == 0 ? 0 : chroma / maxChannel
-        return (tone, hue * 360, saturation, (maxChannel + minChannel) / 2)
+        return (tone, hue, saturation, (maxChannel + minChannel) / 2)
     }
 }

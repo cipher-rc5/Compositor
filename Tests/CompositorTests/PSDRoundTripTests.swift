@@ -234,6 +234,38 @@ struct PSDRoundTripTests {
         #expect(throws: ImageImportError.tooLarge) { try PSDReader.read(header(width: 30_001, height: 10)) }
     }
 
+    private func smallPSD() throws -> Data {
+        let fill = try colorImage(width: 4, height: 2, red: 0, green: 0, blue: 1)
+        var layer = PSDRecord(id: UUID(), name: "Sky")
+        layer.bounds = CGRect(x: 0, y: 0, width: 4, height: 2)
+        layer.image = fill
+        return try PSDFixture.data(PSDDocument(width: 4, height: 2, resolution: 72, layers: [layer]), composite: fill)
+    }
+
+    /// An 8B64 block may declare a length near Int.max; the reader must report the file as truncated, not trap
+    /// adding that length to its offset.
+    @Test func hugeEightByteBlockLengthIsTruncatedWithoutTrapping() throws {
+        var data = try smallPSD()
+        let marker = Data("8BIMluni".utf8)
+        let range = try #require(data.range(of: marker))
+        data.replaceSubrange(range, with: Data("8B64luni".utf8))
+        // The 8B64 length is eight bytes where 8BIM's is four; overwrite them with Int.max.
+        let length = withUnsafeBytes(of: UInt64(Int.max).bigEndian) { Data($0) }
+        data.replaceSubrange(range.upperBound ..< range.upperBound + 8, with: length)
+        #expect(throws: PSDError.truncated) { try PSDReader.read(data) }
+    }
+
+    /// Reading any prefix of a file must throw, never trap. The merged image comes after the layers and is
+    /// never decoded, but a file cut short inside it is still damaged, so those prefixes are refused too.
+    /// PSDHostileInputTests runs the same over more fixtures and mutations.
+    @Test func everyTruncatedPrefixIsRejected() throws {
+        let data = try smallPSD()
+        #expect(try PSDReader.read(data).layers.map(\.name) == ["Sky"])
+        for count in 0 ..< data.count {
+            #expect(throws: PSDError.truncated, "prefix of \(count) bytes") { try PSDReader.read(data.prefix(count)) }
+        }
+    }
+
     @Test func importCreatesDocumentAndExistingCanvasGetsAGroup() async throws {
         let fill = try colorImage(width: 4, height: 2, red: 0, green: 0, blue: 1)
         var layer = PSDRecord(id: UUID(), name: "Sky")
@@ -575,6 +607,9 @@ struct PSDRoundTripTests {
         info32(0)
         append32(UInt32(info.count))
         data.append(info)
+        // Image Data: the merged image, raw, three channels as the header says.
+        data.append(contentsOf: [0, 0])
+        data.append(Data(count: 3 * Int(canvasWidth) * Int(canvasHeight)))
         return data
     }
 }

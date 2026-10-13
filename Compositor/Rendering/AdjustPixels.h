@@ -40,12 +40,6 @@ void adjust_camera_raw(uint8_t *rgba, size_t width, size_t height, size_t stride
                        double redGain, double greenGain, double blueGain, double exposure, double contrast,
                        double highlights, double shadows, double whites, double blacks,
                        double vibrance, double saturation, int clipping);
-// Camera Raw Effects after Light and Color. Texture is a fine local contrast, Clarity a broader one.
-// Dehaze raises contrast and saturation when positive and lifts the shadows when negative. Glow, its
-// range, spread and warmth do nothing until `glow` is above zero: styles are 0 diffusion, 1 bloom,
-// 2 halation. Vignette styles are 0 highlight priority, 1 color priority, 2 paint overlay; Highlights
-// protects bright pixels only while the amount darkens. `scale` is preview pixels per layer pixel, so
-// the radii match a full-size render. Grain is applied separately. Alpha is kept.
 // Blue over clipped shadows and red over clipped highlights, on top of the grade. Preview only.
 void adjust_camera_raw_clip_overlay(uint8_t *rgba, size_t width, size_t height, size_t stride, int shadows, int highlights);
 // Curve, Color Mixer, and Color Grading after the basic grade. `lumaLut` and the channel LUTs are 256
@@ -56,29 +50,41 @@ void adjust_camera_raw_curve_color(uint8_t *rgba, size_t width, size_t height, s
                                    const float *lumaLut, const float *redLut, const float *greenLut, const float *blueLut,
                                    double refineSaturation, const float *mixer, int pointCount, const float *points,
                                    const float *grade, double blending, double balance, int visualize);
-void adjust_camera_raw_effects(uint8_t *rgba, size_t width, size_t height, size_t stride,
-                               double texture, double clarity, double dehaze,
-                               double glow, int glowStyle, double glowRange, double glowSpread, double glowWarmth,
-                               double vignetteAmount, double vignetteMidpoint, double vignetteRoundness,
-                               double vignetteFeather, double vignetteHighlights, int vignetteStyle,
-                               double scale);
+// Camera Raw Effects after Light and Color. Texture is a fine local contrast, Clarity a broader one.
+// Dehaze raises contrast and saturation when positive and lifts the shadows when negative. Glow, its
+// range, spread and warmth do nothing until `glow` is above zero: styles are 0 diffusion, 1 bloom,
+// 2 halation. Vignette styles are 0 highlight priority, 1 color priority, 2 paint overlay; Highlights
+// protects bright pixels only while the amount darkens. `scale` is preview pixels per layer pixel, so
+// the radii match a full-size render. Grain is applied separately. Alpha is kept.
+// This kernel and the three after it return 0 when done, or -1 without changing a pixel when they cannot get the
+// memory they work in. The caller must then fail rather than show or commit the image without that step.
+int adjust_camera_raw_effects(uint8_t *rgba, size_t width, size_t height, size_t stride,
+                              double texture, double clarity, double dehaze,
+                              double glow, int glowStyle, double glowRange, double glowSpread, double glowWarmth,
+                              double vignetteAmount, double vignetteMidpoint, double vignetteRoundness,
+                              double vignetteFeather, double vignetteHighlights, int vignetteStyle,
+                              double scale);
 // Manual noise reduction, then sharpening. `scale` maps radius to preview pixels. Applied after the creative grade.
-void adjust_camera_raw_detail(uint8_t *rgba, size_t width, size_t height, size_t stride,
-                              double sharpenAmount, double sharpenRadius, double sharpenDetail, double sharpenMasking,
-                              double noiseLuminance, double noiseLuminanceDetail, double noiseLuminanceContrast,
-                              double noiseColor, double noiseColorDetail, double noiseColorSmoothness, double scale);
+// Transparent pixels are left out of the blurs, so they don't darken, desaturate or sharpen the pixels beside them.
+int adjust_camera_raw_detail(uint8_t *rgba, size_t width, size_t height, size_t stride,
+                             double sharpenAmount, double sharpenRadius, double sharpenDetail, double sharpenMasking,
+                             double noiseLuminance, double noiseLuminanceDetail, double noiseLuminanceContrast,
+                             double noiseColor, double noiseColorDetail, double noiseColorSmoothness, double scale);
 // Preview only: white where sharpening would land, black where masking protects. Uses the current sharpen sliders.
-void adjust_camera_raw_sharpen_mask_overlay(uint8_t *rgba, size_t width, size_t height, size_t stride,
-                                            double sharpenRadius, double sharpenDetail, double sharpenMasking, double scale);
+int adjust_camera_raw_sharpen_mask_overlay(uint8_t *rgba, size_t width, size_t height, size_t stride,
+                                           double sharpenRadius, double sharpenDetail, double sharpenMasking, double scale);
 // Chromatic aberration, lens distortion, defringe, and lens-vignetting correction. `distortionK` matches `lens_distort`.
-void adjust_camera_raw_optics(uint8_t *rgba, size_t width, size_t height, size_t stride,
-                              int removeChromatic, int lensProfile, double profileDistortion, double profileVignetting,
-                              double distortionK, double purpleAmount, double purpleHueLow, double purpleHueHigh,
-                              double greenAmount, double greenHueLow, double greenHueHigh,
-                              double vignetteAmount, double vignetteMidpoint, double scale);
+int adjust_camera_raw_optics(uint8_t *rgba, size_t width, size_t height, size_t stride,
+                             int removeChromatic, int lensProfile, double profileDistortion, double profileVignetting,
+                             double distortionK, double purpleAmount, double purpleHueLow, double purpleHueHigh,
+                             double greenAmount, double greenHueLow, double greenHueHigh,
+                             double vignetteAmount, double vignetteMidpoint, double scale);
 // Camera calibration before the main grade. Primary hue and saturation shifts are −100…100; shadow tint is green/magenta.
 void adjust_camera_raw_calibration(uint8_t *rgba, size_t width, size_t height, size_t stride,
                                    double shadowTint, double redHue, double redSaturation,
                                    double greenHue, double greenSaturation, double blueHue, double blueSaturation,
                                    int processVersion);
+// Gray-world input for Camera Raw's Auto white balance: the mean of every pixel with alpha, its straight sRGB decoded
+// to linear light, into `average` (red, green, blue). Returns how many pixels counted; with none, `average` is untouched.
+size_t camera_raw_average_linear(const uint8_t *rgba, size_t width, size_t height, size_t stride, double *average);
 #endif

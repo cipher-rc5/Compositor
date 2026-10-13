@@ -54,19 +54,47 @@ extension EditorSession {
         guard let edit = gradientEdit else { return }
         if let start { edit.start = start }
         if let end { edit.end = end }
-        refreshGradient()
+        refreshGradient(dragging: true)
     }
 
-    /// Re-renders the pending gradient from the current endpoints, settings, and palette.
-    func refreshGradient() {
+    /// Re-renders the pending gradient from the current endpoints, settings, and palette. While the line is being
+    /// dragged only what the canvas shows is redone (see `BrushStroke.previewGradient`); the drag's end paints it all.
+    func refreshGradient(dragging: Bool = false) {
         guard let edit = gradientEdit else { return }
         if edit.hasLine {
             do {
-                try edit.raster.fillGradient(gradientSettings.shape, from: edit.start, to: edit.end,
-                    colors: gradientColors(mask: edit.raster.isMask), opacity: gradientSettings.opacity)
+                let colors = gradientColors(mask: edit.raster.isMask)
+                if dragging, let view = gradientView(for: edit.raster) {
+                    try edit.raster.previewGradient(gradientSettings.shape, from: edit.start, to: edit.end, colors: colors,
+                        opacity: gradientSettings.opacity, visible: view.visible, scale: view.scale)
+                } else {
+                    try edit.raster.fillGradient(gradientSettings.shape, from: edit.start, to: edit.end,
+                        colors: colors, opacity: gradientSettings.opacity)
+                }
             } catch { cancelGradient(); brushError = error.localizedDescription; return }
         }
         brushRevision += 1
+    }
+
+    /// The document area the canvas shows, and how many screen pixels one of the edit's pixels covers there. Nil
+    /// until the canvas has a size, when every tile is painted on each move.
+    private func gradientView(for raster: BrushStroke) -> (visible: CGRect, scale: CGFloat)? {
+        guard let document, viewport.viewSize.width > 0, viewport.viewSize.height > 0 else { return nil }
+        let topLeft = viewport.documentPoint(from: .zero, documentSize: document.size)
+        let bottomRight = viewport.documentPoint(from: CGPoint(x: viewport.viewSize.width, y: viewport.viewSize.height),
+                                                 documentSize: document.size)
+        let visible = CGRect(x: topLeft.x, y: topLeft.y, width: bottomRight.x - topLeft.x, height: bottomRight.y - topLeft.y)
+        let documentPerPixel = hypot(raster.pixelToDocument.a, raster.pixelToDocument.b)
+        return (visible.insetBy(dx: -1, dy: -1), documentPerPixel * viewport.pointsPerPixel * viewport.backingScale)
+    }
+
+    /// Paints the tiles a dragged line left behind (see `refreshGradient`).
+    private func completeGradient(_ edit: GradientEdit) -> Bool {
+        do { try edit.raster.completeGradient() } catch {
+            cancelGradient(); brushError = error.localizedDescription
+            return false
+        }
+        return true
     }
 
     func gradientColors(mask: Bool) -> [CGColor] {
@@ -83,7 +111,9 @@ extension EditorSession {
 
     /// Ends a drag; a click without a line leaves nothing pending.
     func endGradientDrag() {
-        if gradientEdit?.hasLine == false { cancelGradient() }
+        guard let edit = gradientEdit else { return }
+        guard edit.hasLine else { cancelGradient(); return }
+        if edit.raster.hasPendingGradient, completeGradient(edit) { brushRevision += 1 }
     }
 
     func cancelGradient() {
@@ -95,6 +125,7 @@ extension EditorSession {
     func commitGradient() async {
         guard let edit = gradientEdit, !isProjectBusy else { return }
         guard edit.hasLine else { cancelGradient(); return }
+        guard completeGradient(edit) else { return }
         do {
             try await commitRasterEdit(edit.raster, name: edit.raster.isMask ? "Gradient Mask" : "Gradient")
         } catch { brushError = error.localizedDescription }

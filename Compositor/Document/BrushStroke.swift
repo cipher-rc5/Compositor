@@ -24,7 +24,7 @@ nonisolated struct BrushSettings: Sendable {
     var healingMode: SpotHealingMode = .contentAware
 }
 
-nonisolated struct BrushPatch: @unchecked Sendable {
+nonisolated struct BrushPatch: Sendable {
     let rect: CGRect
     let image: CGImage
 }
@@ -133,6 +133,11 @@ final class BrushStroke {
     private struct Tile { let rect: CGRect; let context: CGContext; var image: CGImage?; let base: CGImage? }
     private var tiles: [Int: Tile] = [:]
     private let gpu: MetalBrushCoverage?
+    private let gpuQueue: BrushCoverageQueue?
+    /// Set for strokes painted live: a drag event then never waits on the GPU, its paint lands in `patches` a
+    /// moment later, in order, and `onCoverage` says so. Otherwise each append returns with its paint in place.
+    var deliversCoverageLater = false
+    var onCoverage: (() -> Void)?
     private var gpuTiles: [Int: MetalBrushCoverage.Tile] = [:]
     private var gpuTailKeys = Set<Int>()
     /// Per-tile grayscale coverage. Soft tips accumulate paint within the stroke;
@@ -148,6 +153,7 @@ final class BrushStroke {
 
     init(layer: ImageLayer, mask: Bool, settings: BrushSettings, canvas: CGSize, useGPU: Bool = true) throws {
         gpu = useGPU ? MetalBrushCoverage.shared : nil
+        gpuQueue = gpu.map(BrushCoverageQueue.init)
         self.layer = layer
         isMask = mask
         self.settings = settings
@@ -238,7 +244,7 @@ final class BrushStroke {
 
     /// Replaces the provisional tail with the stroke's final curve piece. Safe to repeat.
     func flush() throws {
-        if gpu != nil { try flushContinuous(); return }
+        if let gpuQueue { try flushContinuous(); try gpuQueue.settle(); return }
         var changed = removeTail()
         let count = samples.count
         if count >= 2 {
@@ -330,7 +336,7 @@ final class BrushStroke {
     }
 
     private func renderContinuous(settled: [SIMD4<Float>], tail: [SIMD4<Float>]) throws {
-        guard let gpu else { return }
+        guard let gpu, let gpuQueue else { return }
         let tailKeys = continuousKeys(tail)
         let changed = continuousKeys(settled).union(tailKeys).union(gpuTailKeys)
         let columns = (width + Self.tileSize - 1) / Self.tileSize
@@ -344,9 +350,13 @@ final class BrushStroke {
             }
             work.append((gpuTiles[key]!, tile.rect, coverage[key]!))
         }
-        try gpu.render(work, settled: settled, tail: tail, mapping: pixelToDocument, settings: settings, canvas: canvas.size)
+        try gpuQueue.submit(work, settled: settled, tail: tail, mapping: pixelToDocument, settings: settings, canvas: canvas.size) { [weak self] in
+            guard let self else { return }
+            try self.publish(changed)
+            if self.deliversCoverageLater { self.onCoverage?() }
+        }
         gpuTailKeys = tailKeys
-        try publish(changed)
+        if !deliversCoverageLater { try gpuQueue.settle() }
     }
 
     /// Draws a straight tail to the cursor, first saving the coverage it can touch and the
@@ -606,9 +616,56 @@ final class BrushStroke {
     /// composited onto the original pixels. Redrawing restarts from each tile's original
     /// content, so moving the line never accumulates earlier previews.
     func fillGradient(_ shape: GradientShape, from start: CGPoint, to end: CGPoint, colors: [CGColor], opacity: CGFloat) throws {
+        let draw = try gradientDrawing(shape, from: start, to: end, colors: colors, opacity: opacity)
+        try paintCanvas(draw)
+        pendingGradient = nil
+        gradientPreview = nil
+    }
+
+    // MARK: Gradient previews
+
+    /// The gradient's line as it was last moved, while some tiles don't show it yet (see `previewGradient`).
+    private var pendingGradient: ((CGContext) throws -> Void)?
+    /// While the line is dragged with the layer shown much smaller than its pixels: the layer under the gradient,
+    /// reduced to about the size the canvas shows it, drawn in place of the tiles.
+    private(set) var gradientPreview: CGImage?
+    /// The layer's own pixels reduced to the preview's size, made once for the drag.
+    private var previewBase: (image: CGImage?, width: Int, height: Int)?
+    /// Whether some of the tiles still lag the line (`completeGradient` paints them).
+    var hasPendingGradient: Bool { pendingGradient != nil }
+
+    /// Moves a gradient line that is being dragged. Painting every tile of a large layer for each mouse move is
+    /// what made the drag lag, so only what the canvas shows is redone: the tiles inside `visible` (document
+    /// pixels), or — with the layer shown at under half its size (`scale` screen pixels per layer pixel), when
+    /// that is most of them — a reduced picture of it, `gradientPreview`. The rest waits for `completeGradient`, so
+    /// the finished tiles are painted exactly as `fillGradient` paints them. Mask edits, and layers with a mask or
+    /// effects, which the canvas draws from the tiles, only ever take the first.
+    func previewGradient(_ shape: GradientShape, from start: CGPoint, to end: CGPoint, colors: [CGColor], opacity: CGFloat,
+                         visible: CGRect, scale: CGFloat) throws {
+        let draw = try gradientDrawing(shape, from: start, to: end, colors: colors, opacity: opacity)
+        if !isMask, scale.isFinite, scale > 0, scale < 0.5, layer.mask == nil, layer.effects?.visible.isEmpty != false {
+            gradientPreview = try reducedGradient(draw, scale: scale)
+        } else {
+            gradientPreview = nil
+            try paintCanvas(within: visible, draw)
+        }
+        pendingGradient = draw
+    }
+
+    /// Paints every tile with the line last previewed. Safe to repeat.
+    func completeGradient() throws {
+        guard let draw = pendingGradient else { return }
+        try paintCanvas(draw)
+        pendingGradient = nil
+        gradientPreview = nil
+        previewBase = nil
+    }
+
+    private func gradientDrawing(_ shape: GradientShape, from start: CGPoint, to end: CGPoint, colors: [CGColor],
+                                 opacity: CGFloat) throws -> (CGContext) throws -> Void {
         let space = isMask ? CGColorSpaceCreateDeviceGray() : CGColorSpace(name: CGColorSpace.sRGB)!
         guard let gradient = CGGradient(colorsSpace: space, colors: colors as CFArray, locations: [0, 1]) else { throw ExportError.render }
-        try paintCanvas { context in
+        return { context in
             context.setAlpha(min(1, max(0, opacity)))
             switch shape {
             case .linear:
@@ -620,6 +677,44 @@ final class BrushStroke {
                                            options: [.drawsBeforeStartLocation, .drawsAfterEndLocation])
             }
         }
+    }
+
+    /// The edit's grid at `scale`: the layer's pixels, then `draw` over them clipped as `paintCanvas` clips it.
+    private func reducedGradient(_ draw: (CGContext) throws -> Void, scale: CGFloat) throws -> CGImage {
+        let w = max(1, Int((CGFloat(width) * scale).rounded(.up))), h = max(1, Int((CGFloat(height) * scale).rounded(.up)))
+        if previewBase?.width != w || previewBase?.height != h {
+            previewBase = (try reducedSource(width: w, height: h), w, h)
+        }
+        let context = try BrushRaster.context(width: w, height: h, mask: false)
+        context.clear(CGRect(x: 0, y: 0, width: w, height: h))
+        if let base = previewBase?.image { BrushRaster.draw(base, in: CGRect(x: 0, y: 0, width: w, height: h), mask: false, context: context) }
+        context.saveGState()
+        context.scaleBy(x: CGFloat(w) / CGFloat(width), y: CGFloat(h) / CGFloat(height))
+        context.concatenate(pixelToDocument.inverted())
+        context.clip(to: canvas)
+        selectionClip?.apply(to: context)
+        try draw(context)
+        context.restoreGState()
+        guard let image = context.makeImage() else { throw ExportError.render }
+        return image
+    }
+
+    /// The layer's own pixels where they sit in the grid, reduced to `width` × `height`; nil for a layer with none.
+    private func reducedSource(width w: Int, height h: Int) throws -> CGImage? {
+        guard let source else { return nil }
+        let sx = CGFloat(w) / CGFloat(width), sy = CGFloat(h) / CGFloat(height)
+        let target = CGRect(x: sourceRect.minX * sx, y: sourceRect.minY * sy, width: sourceRect.width * sx, height: sourceRect.height * sy)
+        // A painted layer is reduced from its tiles, so its whole-image bytes are never made just for a preview.
+        let pixels = try layer.asset?.raster.map {
+            try $0.reduced(width: max(1, Int(target.width.rounded())), height: max(1, Int(target.height.rounded())))
+        } ?? DownsampleCache.shared.image(source, drawnAt: sx)
+        let context = try BrushRaster.context(width: w, height: h, mask: false)
+        context.clear(CGRect(x: 0, y: 0, width: w, height: h))
+        context.interpolationQuality = .high
+        context.translateBy(x: target.minX, y: target.maxY)
+        context.scaleBy(x: 1, y: -1)
+        context.draw(pixels, in: CGRect(origin: .zero, size: target.size))
+        return context.makeImage()
     }
 
     /// Fills the selection (or the whole canvas) with a solid color.
@@ -642,9 +737,11 @@ final class BrushStroke {
     /// Runs `draw` in document coordinates over every tile the canvas and selection
     /// cover (only the layer's existing pixels with `withinSource`), clipped to both,
     /// starting from each tile's original content.
-    private func paintCanvas(withinSource: Bool = false, _ draw: (CGContext) throws -> Void) throws {
+    private func paintCanvas(withinSource: Bool = false, within visible: CGRect? = nil, _ draw: (CGContext) throws -> Void) throws {
         var area = canvas
         if let selectionClip { area = area.intersection(selectionClip.rect) }
+        // Only the tiles under `visible` are redone; the clip inside each tile is still the whole canvas's.
+        if let visible { area = area.intersection(visible) }
         guard !area.isNull, !area.isEmpty else { return }
         let inverse = pixelToDocument.inverted()
         var affected = area.applying(inverse).integral.intersection(CGRect(x: 0, y: 0, width: width, height: height))
@@ -756,44 +853,37 @@ final class BrushStroke {
         result.origin = CGPoint(x: center.x - result.size.width / 2, y: center.y - result.size.height / 2)
         return result
     }
-    /// Spot Healing, once the stroke ends: rebuilds the painted area from nearby texture
-    /// (`HealPixels.c`) and writes it into the stroke's tiles, so the usual commit applies it as
-    /// one undo step. Reads the layer's original pixels, never the dark wash shown while painting.
-    func heal() throws {
-        guard settings.healing, !isMask else { return }
+    /// Spot Healing, once the stroke ends: what rebuilding the painted area from nearby texture needs — the layer's
+    /// original pixels around it (never the dark wash shown while painting) and the stroke's coverage — for
+    /// `SpotHealJob.run` to work on off the main thread. Nil when nothing was painted.
+    func healJob() throws -> SpotHealJob? {
+        guard settings.healing, !isMask else { return nil }
         var painted: CGRect?
+        var coverageTiles: [(rect: CGRect, image: CGImage)] = []
         for (key, context) in coverage {
             guard let tile = tiles[key], let data = context.data else { continue }
             var edges = [Int](repeating: 0, count: 4)
             heal_coverage_bounds(data.assumingMemoryBound(to: UInt8.self), Int(tile.rect.width), Int(tile.rect.height),
                                  context.bytesPerRow, &edges)
-            guard edges[2] > edges[0], edges[3] > edges[1] else { continue }
+            guard edges[2] > edges[0], edges[3] > edges[1], let image = context.makeImage() else { continue }
             let rect = CGRect(x: edges[0], y: edges[1], width: edges[2] - edges[0], height: edges[3] - edges[1])
                 .offsetBy(dx: tile.rect.minX, dy: tile.rect.minY)
             painted = painted.map { $0.union(rect) } ?? rect
+            coverageTiles.append((tile.rect, image))
         }
-        guard let painted else { return }
+        guard let painted else { return nil }
         // Room for the kernel's patch search, which looks up to about three spot-widths away.
         let reach = (max(painted.width, painted.height) + 32) * 3.2
         let region = painted.insetBy(dx: -reach, dy: -reach)
             .intersection(CGRect(x: 0, y: 0, width: width, height: height)).integral
-        let w = Int(region.width), h = Int(region.height)
-        let pixels = try BrushRaster.context(width: w, height: h, mask: false)
-        let placed = sourceRect.offsetBy(dx: -region.minX, dy: -region.minY)
-        if let raster = layer.asset?.raster { raster.draw(in: placed, context: pixels) }
-        else if let source { BrushRaster.draw(source, in: placed, mask: false, context: pixels) }
-        let painting = try BrushRaster.context(width: w, height: h, mask: true)
-        for (key, context) in coverage {
-            guard let tile = tiles[key], let image = context.makeImage() else { continue }
-            BrushRaster.draw(image, in: tile.rect.offsetBy(dx: -region.minX, dy: -region.minY), mask: true, context: painting)
-        }
-        guard let rgba = pixels.data, let gray = painting.data else { throw ExportError.render }
-        let mode = Int32(SpotHealingMode.allCases.firstIndex(of: settings.healingMode) ?? 0)
-        guard spot_heal(rgba.assumingMemoryBound(to: UInt8.self), gray.assumingMemoryBound(to: UInt8.self), w, h,
-                        pixels.bytesPerRow, Float(settings.opacity), mode, UInt32.random(in: .min ... .max)) == 0 else {
-            throw ProjectError.tooLarge
-        }
-        guard let healed = pixels.makeImage() else { throw ExportError.render }
+        return SpotHealJob(region: region, raster: layer.asset?.raster, source: source, sourceRect: sourceRect,
+                           coverage: coverageTiles, opacity: Float(settings.opacity),
+                           mode: Int32(SpotHealingMode.allCases.firstIndex(of: settings.healingMode) ?? 0),
+                           seed: UInt32.random(in: .min ... .max))
+    }
+
+    /// Writes a healed region (`SpotHealJob.run`) into the stroke's tiles, so the usual commit applies it as one undo step.
+    func applyHeal(_ healed: CGImage, region: CGRect) {
         for key in coverage.keys {
             guard let tile = tiles[key] else { continue }
             let local = CGRect(origin: .zero, size: tile.rect.size)
@@ -843,7 +933,7 @@ final class BrushStroke {
 
 actor BrushCommit {
     static let shared = BrushCommit()
-    nonisolated struct Input: @unchecked Sendable {
+    nonisolated struct Input: Sendable {
         let width: Int, height: Int
         let source: CGImage?
         let patches: [BrushPatch]
@@ -851,7 +941,7 @@ actor BrushCommit {
         let name: String
         let sourceRect: CGRect
     }
-    nonisolated struct Output: @unchecked Sendable {
+    nonisolated struct Output: Sendable {
         let asset: ImportedImage
         let pixelBounds: CGRect
     }

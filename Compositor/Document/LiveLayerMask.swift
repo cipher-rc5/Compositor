@@ -155,22 +155,45 @@ extension EditorSession {
 }
 
 
-extension EditorSession {
-    func drawLiveComposite(_ document: CanvasDocument, in context: CGContext, onSurface: Bool = false) {
-        if !onSurface, document.layers.contains(where: { $0.adjustment != nil }) {
-            AdjustmentSurface.draw(in: context) { self.drawLiveComposite(document, in: $0, onSurface: true) }
+/// Every visible layer composited as the canvas shows it — opacity, blend modes, masks, clipping, folders and
+/// adjustments — captured on the main actor with the transform, mask placement and blend mode each layer is
+/// displayed with, so the drawing itself can run anywhere, including off the main thread.
+nonisolated struct LiveComposite: Sendable {
+    let layers: [ImageLayer]
+    /// The layers drawn, bottom to top (`CanvasDocument.renderLayers`).
+    let order: [UUID]
+    let transforms: [UUID: LayerTransform]
+    /// Only for masks placed apart from their layer's pixels.
+    let maskPlacements: [UUID: LayerTransform]
+    let blendModes: [UUID: LayerBlendMode]
+    let width: Int
+    let height: Int
+    /// Set for a composite drawn on the main actor, which must not wait on a full-resolution effects render (one
+    /// can take long enough to stall a hover or a click): layers then take effects already made at full size, or else
+    /// the canvas's own preview of them, from here. Nil draws every layer's effects at full size, as export does.
+    var effectsPreviews: [UUID: (image: CGImage, inset: CGFloat, placement: LayerTransform?)]? = nil
+
+    func draw(in context: CGContext, onSurface: Bool = false) {
+        if !onSurface, layers.contains(where: { $0.adjustment != nil }) {
+            AdjustmentSurface.draw(in: context) { draw(in: $0, onSurface: true) }
             return
         }
-        let records = Dictionary(uniqueKeysWithValues: document.layers.map { ($0.id, $0) })
+        let records = Dictionary(uniqueKeysWithValues: layers.map { ($0.id, $0) })
         let live = LiveMaskRenderer(bounds: context.boundingBoxOfClipPath, source: { records[$0]?.maskSourceID }) { id, ctx in
             guard let layer = records[id], let image = layer.asset?.image else { return }
             let opacity = layer.effectiveOpacity(in: records)
-            let transform = self.displayedTransform(for: layer)
-            let mask = layer.mask?.clipImage(placement: self.displayedMaskPlacement(for: layer), over: transform, width: image.width, height: image.height)
-            let effects = LayerEffectsRenderer.cached(image, mask: mask, effects: layer.effects)
+            let transform = transforms[id] ?? layer.transform
+            let mask = layer.mask?.clipImage(placement: maskPlacements[id], over: transform, width: image.width, height: image.height)
+            let effects: (image: CGImage, inset: CGFloat, placement: LayerTransform?)?
+            if let previews = effectsPreviews {
+                effects = LayerEffectsRenderer.existing(image, mask: mask, effects: layer.effects).map { ($0.image, $0.inset, LayerTransform?.none) }
+                    ?? (layer.effects?.visible.isEmpty == false ? previews[id] : nil)
+            } else {
+                effects = LayerEffectsRenderer.cached(image, mask: mask, effects: layer.effects).map { ($0.image, $0.inset, LayerTransform?.none) }
+            }
             func drawLayer(_ mode: LayerBlendMode, _ target: CGContext) {
                 if let effects {
-                    let grown = LayerEffectsRenderer.placed(transform, image: effects.image, inset: effects.inset)
+                    let grown = effects.placement ?? LayerEffectsRenderer.placed(transform, image: effects.image, inset: effects.inset)
                     LayerRenderer.draw(effects.image, transform: grown, center: grown.center, opacity: opacity,
                         blendMode: mode, mask: nil, in: target)
                     return
@@ -178,7 +201,7 @@ extension EditorSession {
                 LayerRenderer.draw(image, transform: transform, center: transform.center, opacity: opacity,
                     blendMode: mode, mask: mask, in: target)
             }
-            let mode = self.displayedBlendMode(for: layer)
+            let mode = blendModes[id] ?? layer.blendMode
             // Core Graphics blends these two wrong; see SeparableBlend.
             if SeparableBlend.needsSurface(mode), SeparableBlend.draw(mode, in: ctx, body: { drawLayer(.normal, $0) }) { return }
             drawLayer(mode, ctx)
@@ -190,13 +213,46 @@ extension EditorSession {
                 FolderMaskClip(image: image, transform: layer.transform).apply(center: layer.transform.center, in: ctx)
             }
         }
-        live.prepareStacks(document.renderLayers.map(\.id), parent: { records[$0]?.parentID }, blend: { records[$0].map { self.displayedBlendMode(for: $0) } ?? .normal })
-        FolderMaskClip.draw(document.renderLayers.map(\.id), parent: { records[$0]?.parentID }, clip: { id in
+        live.prepareStacks(order, parent: { records[$0]?.parentID }, blend: { blendModes[$0] ?? records[$0]?.blendMode ?? .normal })
+        FolderMaskClip.draw(order, parent: { records[$0]?.parentID }, clip: { id in
             guard let folder = records[id], let image = folder.mask?.enabledImage else { return nil }
-            let transform = self.displayedTransform(for: folder)
+            let transform = transforms[id] ?? folder.transform
             let clip = FolderMaskClip(image: image, transform: transform)
             return { clip.apply(center: transform.center, in: $0) }
         }, in: context) { live.drawComposite($0, in: context) }
+    }
+
+    /// The composite at document size, or just `region` of it.
+    func render(region: CGRect? = nil) throws -> CGImage {
+        let area = region ?? CGRect(x: 0, y: 0, width: width, height: height)
+        let context = try BrushRaster.context(width: Int(area.width), height: Int(area.height), mask: false)
+        context.translateBy(x: -area.minX, y: -area.minY)
+        draw(in: context)
+        guard let image = context.makeImage() else { throw ExportError.render }
+        return image
+    }
+}
+
+extension EditorSession {
+    /// `document` as the canvas shows it right now, ready to draw on any thread.
+    func liveComposite(_ document: CanvasDocument) -> LiveComposite {
+        LiveComposite(layers: document.layers, order: document.renderLayers.map(\.id),
+                      transforms: Dictionary(uniqueKeysWithValues: document.layers.map { ($0.id, displayedTransform(for: $0)) }),
+                      maskPlacements: Dictionary(uniqueKeysWithValues: document.layers.compactMap { layer in
+                          displayedMaskPlacement(for: layer).map { (layer.id, $0) }
+                      }),
+                      blendModes: Dictionary(uniqueKeysWithValues: document.layers.map { ($0.id, displayedBlendMode(for: $0)) }),
+                      width: document.width, height: document.height)
+    }
+
+    /// Draws on the main actor, for sampling under the pointer (the eyedropper, Clone Stamp): effects come from what
+    /// is already made rather than a full-resolution render (see `LiveComposite.effectsPreviews`).
+    func drawLiveComposite(_ document: CanvasDocument, in context: CGContext) {
+        var composite = liveComposite(document)
+        composite.effectsPreviews = Dictionary(uniqueKeysWithValues: document.layers.compactMap { layer in
+            effectsPreviews.rendered(layer.id).map { (layer.id, $0) }
+        })
+        composite.draw(in: context)
     }
 }
 

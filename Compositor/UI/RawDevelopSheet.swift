@@ -8,6 +8,8 @@ struct RawDevelopSheet: View {
     let url: URL
     @State private var settings: RawDevelopSettings
     @State private var preview: CGImage?
+    /// Why the last develop failed. Import stays off until one succeeds, since it would only fail the same way.
+    @State private var failure: String?
     @State private var working = true
     @State private var revision = 0
 
@@ -22,7 +24,10 @@ struct RawDevelopSheet: View {
             Text("Develop “\(url.lastPathComponent)”").font(.title2.bold())
             ZStack {
                 RoundedRectangle(cornerRadius: 6).fill(Color.black.opacity(0.35))
-                if let preview {
+                if let failure {
+                    Label(failure, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.secondary).multilineTextAlignment(.center).padding(24)
+                } else if let preview {
                     Image(decorative: preview, scale: 1)
                         .resizable().aspectRatio(contentMode: .fit)
                         .clipShape(RoundedRectangle(cornerRadius: 6))
@@ -41,6 +46,7 @@ struct RawDevelopSheet: View {
                 Spacer()
                 Button("Cancel") { session.finishRawDevelop(nil) }.keyboardShortcut(.cancelAction)
                 Button("Import") { session.finishRawDevelop(settings) }.keyboardShortcut(.defaultAction)
+                    .disabled(failure != nil)
             }
         }
         .padding(24).fixedSize()
@@ -59,9 +65,17 @@ struct RawDevelopSheet: View {
         defer { working = false }
         let current = settings
         let file = url
-        let image = await RawImporter.Queue.shared.develop(file, settings: current, limit: 800)
-        guard !Task.isCancelled else { return }
-        if let image { preview = image }
+        do {
+            let image = try await RawImporter.Queue.shared.develop(file, settings: current, limit: 800)
+            guard !Task.isCancelled else { return }
+            preview = image
+            failure = nil
+        } catch {
+            guard !Task.isCancelled else { return }
+            // A stale frame would show settings that didn't develop.
+            preview = nil
+            failure = error.localizedDescription
+        }
     }
 
     private func slider(_ title: String, value: Binding<Float>, range: ClosedRange<Float>,

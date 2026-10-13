@@ -55,6 +55,9 @@ struct ShapeControls: View {
                 }
                 .buttonStyle(.plain)
                 .help("Shapes fill with the foreground color; click to change it")
+                .accessibilityLabel("Fill color")
+                .accessibilityValue(session.foregroundColor.nsColor.accessibilityName)
+                .accessibilityHint("Shapes fill with the foreground color. Opens the color picker.")
             }
             Spacer(minLength: 0)
         }

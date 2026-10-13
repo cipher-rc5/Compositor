@@ -1,33 +1,49 @@
 import AppKit
 import Vision
 import CoreImage
+import Synchronization
 
 nonisolated enum SubjectRemoval {
     enum Failure: LocalizedError {
         case noSubject
         var errorDescription: String? { "No foreground subject was detected in this layer. Try an image with a more distinct subject." }
     }
-    /// Vision's own mask for an image, kept while the panel is open so moving a slider only redoes the refining.
-    private static let cache = MaskCache()
-    private final class MaskCache: @unchecked Sendable {
-        private let lock = NSLock()
-        private var key: ObjectIdentifier?
-        private var value: CGImage?
+    /// Vision's own mask for an image, kept while the Remove Background panel is open so moving a slider only redoes
+    /// the refining. It holds a full image and its mask, so it is let go when the panel closes (`forgetMask`).
+    static let cache = MaskCache()
+    final class MaskCache: Sendable {
+        private struct State {
+            /// The image the mask was made for, held so its address can't be reused by another image while cached.
+            var key: CGImage?
+            var value: CGImage?
+            /// Moves on with every `forget`, so a mask still being made when the panel closed isn't kept after it.
+            var generation = 0
+        }
+        private let state = Mutex(State())
         func mask(for image: CGImage, make: () throws -> CGImage) throws -> CGImage {
-            lock.lock()
-            let hit = key == ObjectIdentifier(image) ? value : nil
-            lock.unlock()
+            let (hit, started) = state.withLock { ($0.key === image ? $0.value : nil, $0.generation) }
             if let hit { return hit }
             let made = try make()
-            lock.lock(); key = ObjectIdentifier(image); value = made; lock.unlock()
+            state.withLock { if $0.generation == started { $0.key = image; $0.value = made } }
             return made
         }
+        func forget() {
+            state.withLock {
+                $0.key = nil
+                $0.value = nil
+                $0.generation += 1
+            }
+        }
+        var isEmpty: Bool { state.withLock { $0.key == nil && $0.value == nil } }
     }
 
+    /// Lets go of the cached mask and the image it was made for (see `cache`).
+    static func forgetMask() { cache.forget() }
+
     /// Vision's raw subject mask, white over the subject: the model has no settings of its own, so everything the
-    /// panel offers is done to this afterwards by `refined`.
-    private static func vision(_ image: CGImage) throws -> CGImage {
-        try cache.mask(for: image) {
+    /// panel offers is done to this afterwards by `refined`. Cached only for the panel (`caching`).
+    private static func vision(_ image: CGImage, caching: Bool = true) throws -> CGImage {
+        func make() throws -> CGImage {
             let handler = VNImageRequestHandler(cgImage: image, orientation: .up)
             let request = VNGenerateForegroundInstanceMaskRequest()
             try handler.perform([request])
@@ -35,6 +51,7 @@ nonisolated enum SubjectRemoval {
             let buffer = try result.generateScaledMaskForImage(forInstances: result.allInstances, from: handler)
             return try PixelAdjust.render(CIImage(cvPixelBuffer: buffer), width: image.width, height: image.height, isMask: true)
         }
+        return caching ? try cache.mask(for: image, make: make) : try make()
     }
 
     /// The panel's three controls, in the order they help:
@@ -84,8 +101,8 @@ nonisolated enum SubjectRemoval {
 
     /// Where the subject is: white over it, black over the background, the size of the layer's own pixels — a layer
     /// mask that hides the background instead of erasing it. `under` is the layer's existing mask, kept as well.
-    static func subjectMask(_ image: CGImage, under existing: CGImage?, settings: FilterSettings) throws -> CGImage {
-        let subject = try refined(vision(image), guide: image, settings: settings, limit: .greatestFiniteMagnitude)
+    static func subjectMask(_ image: CGImage, under existing: CGImage?, settings: FilterSettings, caching: Bool = true) throws -> CGImage {
+        let subject = try refined(vision(image, caching: caching), guide: image, settings: settings, limit: .greatestFiniteMagnitude)
         guard let existing else { return subject }
         // Both masks hide: what either one hides stays hidden.
         let context = try BrushRaster.context(width: image.width, height: image.height, mask: true)
@@ -117,27 +134,37 @@ extension EditorSession {
     var canSelectSubject: Bool { canEditSelection && document != nil && !isProjectBusy }
 
     func selectSubject(mode: SelectionMode = .replace) async {
-        guard canSelectSubject, let document,
-              let context = try? BrushRaster.context(width: document.width, height: document.height, mask: false) else { return }
-        drawLiveComposite(document, in: context)
-        guard let shown = context.makeImage() else { return }
+        guard canSelectSubject, let document else { return }
+        // Composited, masked and traced off the main thread.
+        let composite = liveComposite(document)
         isProjectBusy = true
-        let found = await Task.detached(priority: .userInitiated) { () -> Result<CGImage, Error> in
-            do { return .success(try SubjectRemoval.subjectMask(shown, under: nil, settings: FilterSettings())) }
-            catch { return .failure(error) }
+        let found = await Task.detached(priority: .userInitiated) { () -> Result<TracedOutline, Error> in
+            do {
+                // A one-off: a composite is never drawn twice the same, so caching it would only pin it.
+                let mask = try SubjectRemoval.subjectMask(try composite.render(), under: nil, settings: FilterSettings(), caching: false)
+                // White where the subject is, so its outline is the selection.
+                return .success(TracedOutline(path: try MaskTracing.whitePixels(in: mask), width: mask.width, height: mask.height))
+            } catch { return .failure(error) }
         }.value
         isProjectBusy = false
-        guard self.document?.id == document.id else { return }
+        guard self.document?.id == document.id else { ToolLog.staleResult("Select Subject"); return }
         switch found {
         case .failure(let error):
             brushError = error.localizedDescription
-        case .success(let mask):
-            // White where the subject is, so its outline is the selection.
-            guard let traced = MaskTracing.whitePixels(in: mask) else { NSSound.beep(); return }
+        case .success(let traced):
+            guard let path = traced.path else { NSSound.beep(); return }
             var toDocument = BrushRaster.pixelToDocument(LayerTransform(origin: .zero, size: document.size),
-                                                         width: mask.width, height: mask.height)
-            guard let outline = traced.copy(using: &toDocument) else { return }
+                                                         width: traced.width, height: traced.height)
+            guard let outline = path.copy(using: &toDocument) else { return }
             applySelection(outline, mode: mode, name: "Select Subject")
         }
     }
+}
+
+/// An outline traced off the main thread, in the pixels of the `width` × `height` image it was traced from.
+/// Unchecked only because CGPath isn't marked Sendable: the path is made by the trace and never mutated afterwards.
+private nonisolated struct TracedOutline: @unchecked Sendable {
+    let path: CGPath?
+    let width: Int
+    let height: Int
 }

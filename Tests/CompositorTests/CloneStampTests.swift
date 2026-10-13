@@ -75,4 +75,50 @@ struct CloneStampTests {
         session.selectTool(.cloneStamp)
         #expect(session.brushSettings.hardness == 0.5 && session.brushSettings.diameter == 40)
     }
+
+    /// A canvas too large for the copy Clone Stamp paints from says so, rather than leaving the stroke to do nothing.
+    @Test func aCanvasTooLargeForTheSampleReportsIt() async throws {
+        let session = EditorSession()
+        session.createDocument(width: 40, height: 20)
+        let context = try BrushRaster.context(width: 40, height: 20, mask: false)
+        context.setFillColor(CGColor(srgbRed: 1, green: 0, blue: 0, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: 40, height: 20))
+        let image = try #require(context.makeImage())
+        session.insert(ImportedImage(image: image, thumbnail: image, name: "Red"))
+        session.selectTool(.cloneStamp)
+        session.setCloneSource(CGPoint(x: 5, y: 5))
+        let document = try #require(session.document)
+        // Rows of 2³¹ bytes: more than a bitmap can hold.
+        session.document = CanvasDocument(id: document.id, width: 1 << 29, height: 20, layers: document.layers)
+        let count = session.history.undoCount
+        await stroke(session, at: CGPoint(x: 30, y: 10))
+        #expect(await waitUntil { session.brushError != nil })
+        #expect(session.brushStroke == nil && !session.isProjectBusy && session.history.undoCount == count)
+    }
+
+    /// Mouse-up before the source has landed: held, then committed from the source once it does.
+    @Test func aStrokeLetGoBeforeItsSourceLandsCopiesTheSource() async throws {
+        let session = EditorSession()
+        session.createDocument(width: 40, height: 20)
+        let context = try BrushRaster.context(width: 40, height: 20, mask: false)
+        context.setFillColor(CGColor(srgbRed: 0, green: 0, blue: 1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: 40, height: 20))
+        context.setFillColor(CGColor(srgbRed: 0, green: 1, blue: 0, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: 10, height: 20))
+        let image = try #require(context.makeImage())
+        session.insert(ImportedImage(image: image, thumbnail: image, name: "Colors"))
+        session.selectTool(.cloneStamp)
+        session.brushSettings = BrushSettings(diameter: 6, hardness: 1, red: 0, green: 0, blue: 0)
+        session.setCloneSource(CGPoint(x: 5, y: 10))
+        let count = session.history.undoCount
+        session.beginBrush(at: CGPoint(x: 30, y: 10))
+        session.continueBrush(at: CGPoint(x: 30.5, y: 10))
+        #expect(session.finishBrushImmediately())
+        #expect(await waitUntil { !session.isProjectBusy && session.brushStroke == nil })
+        #expect(session.brushError == nil && session.history.undoCount == count + 1 && session.history.undoName == "Clone Stamp")
+        let after = try pixels(try await ImageExporter.shared.render(try #require(session.projectSnapshot())).image)
+        #expect(after(30, 10) == [0, 255, 0, 255])
+        #expect(after(38, 2) == [0, 0, 255, 255])
+    }
 }
+

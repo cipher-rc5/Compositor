@@ -82,7 +82,7 @@ struct ContentView: View {
                 toolRail
                 Divider()
                 VStack(spacing: 0) {
-                    if session.showsRulers, session.document != nil {
+                    if session.showsRulers, session.hasDocument {
                         HStack(spacing: 0) {
                             CanvasRulerCorner()
                             CanvasRulerView(session: session, axis: .horizontal)
@@ -90,13 +90,13 @@ struct ContentView: View {
                         }
                     }
                     HStack(spacing: 0) {
-                        if session.showsRulers, session.document != nil {
+                        if session.showsRulers, session.hasDocument {
                             CanvasRulerView(session: session, axis: .vertical)
                                 .frame(width: CanvasRuler.thickness)
                         }
                         ZStack {
                             EditorCanvas(session: session)
-                            if session.document == nil { welcome }
+                            if !session.hasDocument { welcome }
                         }
                         .onGeometryChange(for: CGRect.self) { $0.frame(in: .named("editor")) } action: { canvasFrame = $0 }
                     }
@@ -106,7 +106,7 @@ struct ContentView: View {
             }
             Divider()
             // Keeps its own height however short the window gets; the tools scroll instead.
-            statusBar.fixedSize(horizontal: false, vertical: true)
+            EditorStatusBar(session: session).fixedSize(horizontal: false, vertical: true)
                 .modifier(WidthReader(width: $windowWidth))
         }
     }
@@ -173,17 +173,17 @@ struct ContentView: View {
             ToolbarSpacer(.flexible, placement: .navigation)
             ToolbarItemGroup(placement: .primaryAction) {
                 Button("Fit") { session.fit() }.help("Fit canvas in window (⌘0)")
-                    .accessibilityIdentifier("fitCanvas").disabled(session.document == nil)
+                    .accessibilityIdentifier("fitCanvas").disabled(!session.hasDocument)
                 Button("100%") { session.zoom(to: 1) }.help("Actual pixels (⌘1)")
-                    .accessibilityIdentifier("actualPixels").disabled(session.document == nil)
+                    .accessibilityIdentifier("actualPixels").disabled(!session.hasDocument)
             }
             ToolbarItemGroup(placement: .primaryAction) {
                 Button { session.zoom(to: session.viewport.zoom * 1.25) } label: {
                     Image(systemName: "plus.magnifyingglass")
-                }.help("Zoom in (⌘+)").disabled(session.document == nil)
+                }.help("Zoom in (⌘+)").disabled(!session.hasDocument)
                 Button { session.zoom(to: session.viewport.zoom / 1.25) } label: {
                     Image(systemName: "minus.magnifyingglass")
-                }.help("Zoom out (⌘−)").disabled(session.document == nil)
+                }.help("Zoom out (⌘−)").disabled(!session.hasDocument)
             }
         }
     }
@@ -210,14 +210,7 @@ struct ContentView: View {
                 effectsPanel.show(title: selection.kind.rawValue, content: EffectsSheet(session: session, kind: selection.kind))
             } else { effectsPanel.close() }
         }
-        .onChange(of: session.document?.layers) { _, layers in
-            if let editing = session.effectsEditing,
-               layers?.first(where: { $0.id == editing.layerID })?.effects?.contains(editing.kind) != true {
-                if let picker = session.colorPicker, case .effect = picker.target { session.closeColorPicker(commit: false) }
-                session.effectsEditing = nil
-                session.effectsEditingOriginal = nil
-            }
-        }
+        .background { EffectsEditingWatcher(session: session) }
         .onChange(of: session.selectionAmountOperation) { _, operation in
             if let operation {
                 selectionAmountPanel.onClose = { session.selectionAmountOperation = nil }
@@ -234,8 +227,8 @@ struct ContentView: View {
                                  placement: placement)
             }
         }
-        .onChange(of: session.document == nil) { _, empty in
-            if !empty { session.canvasFocusRequest += 1 }
+        .onChange(of: session.hasDocument) { _, exists in
+            if exists { session.canvasFocusRequest += 1 }
         }
         .fileImporter(isPresented: $session.showsImporter,
                       allowedContentTypes: UTType.importableImages, allowsMultipleSelection: true) { result in
@@ -303,7 +296,15 @@ struct ContentView: View {
             onCreate: { session.createNewProject(width: $0, height: $1) },
             onOpen: { Task { await applicationDelegate?.projects.open() } })
     }
-    private var statusBar: some View {
+}
+
+/// The bar along the window's foot: the canvas's zoom and size, then what's going on or how to use the current tool.
+/// A view of its own because it reads the document (for its size), which changes with every stroke: reading it in
+/// `ContentView` would re-render the whole editor each time.
+struct EditorStatusBar: View {
+    let session: EditorSession
+
+    var body: some View {
         HStack(spacing: 16) {
             if let document = session.document {
                 Text(session.viewport.zoom, format: .percent.precision(.fractionLength(0...1)))
@@ -319,12 +320,90 @@ struct ContentView: View {
                 ProgressView().controlSize(.mini)
                 Text("Importing images…")
             } else {
-                Text(session.tool == .marquee ? (session.marqueeKind == .ellipse ? "Drag an ellipse · Shift add · Option subtract · Shift again mid-drag circle · Drag inside to move · Delete clears · ⌘D deselect" : "Drag a rectangle · Shift add · Option subtract · Shift again mid-drag square · Drag inside to move · ⌘-drag moves pixels · Delete clears · ⌘D deselect") : session.tool == .wand ? (session.wandMode == .object ? "Click an object to select its outline · Tab for Wand · Shift add · Option subtract · Drag inside to move · ⌘-drag moves pixels · Delete clears · ⌘D deselect" : "Click to select similar colors · Tab for Object · Shift add · Option subtract · Drag inside to move · ⌘-drag moves pixels · Delete clears · ⌘D deselect") : session.tool == .lasso ? (session.lassoKind == .freehand ? "Drag to select · Drag inside to move · Shift add · Option subtract · Delete clears · ⌥⌫/⌘⌫ fill · ⌘D deselect" : "Click corners · Click start, double-click or Enter to close · Delete removes corner · Escape cancel") : session.tool == .brush ? (session.brushMode == .erase ? "Drag to erase" : "Drag to paint") + " · [ ] size · Shift-[ ] hardness · 1–0 opacity · Escape cancel · Space to pan" : session.tool == .blur ? (session.blurMode == .blur ? "Drag to soften" : session.blurMode == .smudge ? "Drag to smudge" : "Drag to push pixels") + " · [ ] size · Shift-[ ] hardness · 1–0 strength · Space to pan" : session.tool == .cloneStamp ? "Option-click to set the source · Drag to clone · [ ] size · Shift-[ ] hardness · 1–0 opacity · Space to pan" : session.tool == .spotHealing ? "Drag over blemishes to heal · [ ] size · Shift-[ ] hardness · Escape cancel · Space to pan" : session.tool == .type ? "Drag a text box · Click text to edit · Drag box handles to resize · ⌘Return finish · Escape cancel" : session.tool == .shape ? "Drag to draw a shape on a new layer · Shift \(session.shapeKind == .line ? "45°" : session.shapeKind == .rectangle ? "square" : "circle") · Option from center · Shift-U or Tab for the next shape · Escape cancel · Space to pan" : session.tool == .gradient ? "Drag to draw · Drag ends to adjust · Shift 45° · 1–0 opacity · Enter apply · Escape cancel" : session.tool == .crop ? "Drag to crop · Enter apply · Escape cancel · Space to pan" : session.tool == .move ? "Drag to move · Handles to resize · Circle to rotate · 1–0 layer opacity · Space to pan" : session.tool == .hand ? "Drag to pan · Pinch to zoom" : session.tool == .idle ? "No tool selected · Press a tool's key to pick one · Space to pan" : "Click to zoom in · Option-click to zoom out · Drag right or left to zoom smoothly · Space to pan")
+                Text(Self.hint(for: session))
             }
         }
         .font(.system(size: 11).monospacedDigit()).foregroundStyle(.secondary)
         .padding(.horizontal, 18).frame(height: 30)
         .accessibilityElement(children: .contain)
+    }
+
+    /// How to use the current tool, in the mode it is in.
+    static func hint(for session: EditorSession) -> String {
+        let brushKeys = "[ ] size · Shift-[ ] hardness"
+        switch session.tool {
+        case .marquee:
+            return session.marqueeKind == .ellipse
+                ? "Drag an ellipse · Shift add · Option subtract · Shift again mid-drag circle · Drag inside to move · Delete clears · ⌘D deselect"
+                : "Drag a rectangle · Shift add · Option subtract · Shift again mid-drag square · Drag inside to move · ⌘-drag moves pixels · Delete clears · ⌘D deselect"
+        case .wand:
+            return session.wandMode == .object
+                ? "Click an object to select its outline · Tab for Wand · Shift add · Option subtract · Drag inside to move · ⌘-drag moves pixels · Delete clears · ⌘D deselect"
+                : "Click to select similar colors · Tab for Object · Shift add · Option subtract · Drag inside to move · ⌘-drag moves pixels · Delete clears · ⌘D deselect"
+        case .lasso:
+            return session.lassoKind == .freehand
+                ? "Drag to select · Drag inside to move · Shift add · Option subtract · Delete clears · ⌥⌫/⌘⌫ fill · ⌘D deselect"
+                : "Click corners · Click start, double-click or Enter to close · Delete removes corner · Escape cancel"
+        case .brush:
+            let action = session.brushMode == .erase ? "Drag to erase" : "Drag to paint"
+            return "\(action) · \(brushKeys) · 1–0 opacity · Escape cancel · Space to pan"
+        case .blur:
+            let action: String
+            switch session.blurMode {
+            case .blur: action = "Drag to soften"
+            case .smudge: action = "Drag to smudge"
+            case .liquify: action = "Drag to push pixels"
+            }
+            return "\(action) · \(brushKeys) · 1–0 strength · Space to pan"
+        case .cloneStamp:
+            return "Option-click to set the source · Drag to clone · \(brushKeys) · 1–0 opacity · Space to pan"
+        case .spotHealing:
+            return "Drag over blemishes to heal · \(brushKeys) · Escape cancel · Space to pan"
+        case .type:
+            return "Drag a text box · Click text to edit · Drag box handles to resize · ⌘Return finish · Escape cancel"
+        case .shape:
+            let constrained: String
+            switch session.shapeKind {
+            case .line: constrained = "45°"
+            case .rectangle: constrained = "square"
+            case .ellipse: constrained = "circle"
+            }
+            return "Drag to draw a shape on a new layer · Shift \(constrained) · Option from center · Shift-U or Tab for the next shape · Escape cancel · Space to pan"
+        case .gradient:
+            return "Drag to draw · Drag ends to adjust · Shift 45° · 1–0 opacity · Enter apply · Escape cancel"
+        case .crop:
+            return "Drag to crop · Enter apply · Escape cancel · Space to pan"
+        case .move:
+            return "Drag to move · Handles to resize · Circle to rotate · 1–0 layer opacity · Space to pan"
+        case .hand:
+            return "Drag to pan · Pinch to zoom"
+        case .idle:
+            return "No tool selected · Press a tool's key to pick one · Space to pan"
+        case .eyedropper:
+            return "Click to sample a color into the foreground · Space to pan"
+        case .zoom:
+            return "Click to zoom in · Option-click to zoom out · Drag right or left to zoom smoothly · Space to pan"
+        }
+    }
+}
+
+/// Closes the effects panel once the effect it edits is gone (deleted, undone, or its layer removed). A view of its
+/// own so that only it, and only while the panel is open, re-renders as the document changes.
+private struct EffectsEditingWatcher: View {
+    let session: EditorSession
+
+    private var editedEffectExists: Bool {
+        guard let editing = session.effectsEditing else { return true }
+        return session.document?.layers.first(where: { $0.id == editing.layerID })?.effects?.contains(editing.kind) == true
+    }
+
+    var body: some View {
+        Color.clear.onChange(of: editedEffectExists) { _, exists in
+            guard !exists, session.effectsEditing != nil else { return }
+            if let picker = session.colorPicker, case .effect = picker.target { session.closeColorPicker(commit: false) }
+            session.effectsEditing = nil
+            session.effectsEditingOriginal = nil
+        }
     }
 }
 
@@ -371,9 +450,7 @@ extension View {
     var editing = false
     var value: () -> Double = { 0 }
     var change: (Double) -> Void = { _ in }
-    // Removed in deinit, which is nonisolated in Swift 6; the monitor is an opaque `Any?`
-    // the compiler can't prove Sendable, and this only ever deinits on the main thread.
-    nonisolated(unsafe) private var monitor: Any?
+    private var monitor: Any?
 
     /// Takes Up and Down while the field holds focus: one step, or ten with Shift.
     func listen(step: Double) {
@@ -393,7 +470,8 @@ extension View {
         monitor = nil
         editing = false
     }
-    deinit {
+    // Isolated, so it can read the main-actor monitor it removes.
+    isolated deinit {
         if let monitor { NSEvent.removeMonitor(monitor) }
     }
 }

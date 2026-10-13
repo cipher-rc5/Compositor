@@ -165,10 +165,8 @@ extension PaletteColor {
 final class ColorPickerPanelController: NSObject {
     static let identifier = NSUserInterfaceItemIdentifier("colorPickerPanel")
     private let panel = FloatingPanelController(name: "colorPickerPanel")
-    private weak var session: EditorSession?
 
     func show(_ state: ColorPickerState, session: EditorSession) {
-        self.session = session
         panel.onClose = { [weak session] in
             if session?.colorPicker != nil { session?.closeColorPicker(commit: false) }
         }

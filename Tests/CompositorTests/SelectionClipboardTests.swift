@@ -149,7 +149,8 @@ struct SelectionClipboardTests {
         draft.size = CGSize(width: 20, height: 20)   // 2× larger…
         draft.origin = CGPoint(x: 90, y: 30)          // …and hanging off the canvas corner.
         session.previewTransform(draft)
-        session.selectTool(.lasso)                    // Switching tools applies it.
+        session.selectTool(.lasso)                    // Switching tools applies it, rendered off the main thread.
+        #expect(await waitUntil { session.tool == .lasso })
         #expect(session.transformEdit == nil && session.history.undoName == "Transform Selection")
         let layer = try #require(session.document?.layers.first { $0.id == source })
         #expect(layer.size == CGSize(width: 110, height: 50))
@@ -198,7 +199,7 @@ struct SelectionClipboardTests {
         session.selectLayer(green)
         select(session, CGRect(x: 55, y: 5, width: 30, height: 30))
         #expect(session.canCopyMerged)
-        session.copyMergedSelection() // Every visible layer.
+        await session.copyMergedSelection() // Every visible layer.
         session.paste()
         pasted = try #require(session.activeLayer)
         #expect(try await layerPixel(session, pasted.id, x: 65, y: 15) == [0, 255, 0, 255])
@@ -209,9 +210,142 @@ struct SelectionClipboardTests {
         session.selectLayer(green)
         session.toggleLayerVisibility(green)
         select(session, CGRect(x: 55, y: 5, width: 30, height: 30))
-        session.copyMergedSelection()
+        await session.copyMergedSelection()
         session.paste()
         pasted = try #require(session.activeLayer)
         #expect(try await layerPixel(session, pasted.id, x: 65, y: 15) == [0, 0, 255, 255])
+    }
+
+    /// Cut clears only what it managed to copy: when the copy fails, the pixels stay and nothing is recorded.
+    @Test func aCutThatCopiesNothingClearsNothing() async throws {
+        let session = await makeSession()
+        // A sliver too thin to hold a whole pixel: there is nothing to copy, though Clear would still run.
+        select(session, CGRect(x: 20, y: 10, width: 0.0005, height: 20))
+        #expect(session.canCopyPixels && session.selectionCopyRegion() == nil)
+        let before = session.document, count = session.history.undoCount
+        #expect(!session.copySelection())
+        await session.cutSelection()
+        #expect(session.document == before && session.history.undoCount == count)
+        await session.clearSelectedPixels()
+        #expect(session.history.undoCount == count + 1, "Clear on its own records a step, so the cut above really skipped it")
+    }
+
+    /// On a pasteboard of the test's own, not the system's: what the person running the tests copied stays put.
+    @Test func copyPutsAPNGOnThePasteboard() async throws {
+        let session = await makeSession()
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("CompositorTests-\(UUID().uuidString)"))
+        defer { pasteboard.releaseGlobally() }
+        session.pasteboard = pasteboard
+        let systemChangeCount = NSPasteboard.general.changeCount
+        select(session, CGRect(x: 40, y: 10, width: 20, height: 20))
+        #expect(session.copySelection())
+        await session.pasteboardWrite?.value
+        let data = try #require(pasteboard.data(forType: .png))
+        let image = try #require(NSBitmapImageRep(data: data)?.cgImage)
+        #expect(image.width == 20 && image.height == 20)
+        #expect(try pixel(image, x: 2, y: 2) == [255, 0, 0, 255] && pixel(image, x: 17, y: 2) == [0, 0, 255, 255])
+        // Writing the PNG doesn't count as another app's copy: Paste still puts the pixels back in place.
+        #expect(session.canPaste && session.pixelClipboard?.changeCount == pasteboard.changeCount)
+        #expect(NSPasteboard.general.changeCount == systemChangeCount)
+    }
+
+    // MARK: The 100-megapixel budget a project can save
+
+    /// A gray image of the given size whose pixels are never touched, so a test can stand near the budget cheaply.
+    private func untouched(width: Int, height: Int) throws -> ImportedImage {
+        let provider = try #require(CGDataProvider(data: Data(count: width * height) as CFData))
+        let image = try #require(CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 8, bytesPerRow: width,
+                                         space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGBitmapInfo(rawValue: 0),
+                                         provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent))
+        return ImportedImage(image: image, thumbnail: image, name: "Large")
+    }
+
+    /// `makeSession`'s canvas with a layer of `megapixels` million image pixels added beneath, never drawn.
+    private func crowdedSession(holding megapixels: Int) async throws -> EditorSession {
+        let session = await makeSession()
+        let large = ImageLayer(asset: try untouched(width: 10_000, height: megapixels * 100), origin: .zero)
+        session.document?.layers.insert(large, at: 0)
+        return session
+    }
+
+    @Test func duplicatingPastTheBudgetIsRefusedAndSaysSo() async throws {
+        let session = try await crowdedSession(holding: 60)
+        let large = try #require(session.document?.layers.first)
+        session.selectLayer(large.id)
+        let before = session.document, count = session.history.undoCount
+        session.duplicateActiveLayer()
+        #expect(session.document == before && session.history.undoCount == count)
+        #expect(session.brushError?.contains("100 megapixels") == true)
+        // The small layer still fits.
+        session.brushError = nil
+        session.selectLayer(try #require(session.document?.layers.last?.id))
+        session.duplicateActiveLayer()
+        #expect(session.document?.layers.count == 3 && session.brushError == nil)
+    }
+
+    @Test func pastingPastTheBudgetIsRefusedAndSaysSo() async throws {
+        let session = try await crowdedSession(holding: 99)
+        let clip = try untouched(width: 2_000, height: 1_000)
+        session.pixelClipboard = PixelClipboard(image: clip.image, origin: .zero, changeCount: NSPasteboard.general.changeCount)
+        let before = session.document, count = session.history.undoCount
+        #expect(session.canPaste)
+        session.paste()
+        #expect(session.document == before && session.history.undoCount == count)
+        #expect(session.brushError?.contains("Paste") == true)
+        session.pixelClipboard = nil
+    }
+
+    @Test func layerViaCopyPastTheBudgetIsRefusedAndSaysSo() async throws {
+        // 99,995,000 beside the canvas's own 4,000: the 2,000 more a copy of half the canvas needs don't fit.
+        let session = await makeSession()
+        let large = ImageLayer(asset: try untouched(width: 19_999, height: 5_000), origin: .zero)
+        session.document?.layers.insert(large, at: 0)
+        session.selectLayer(try #require(session.document?.layers.last?.id))
+        select(session, CGRect(x: 0, y: 0, width: 50, height: 40))
+        let before = session.document, count = session.history.undoCount
+        session.layerViaCopy()
+        #expect(session.document == before && session.history.undoCount == count)
+        #expect(session.brushError?.contains("Layer via Copy") == true)
+        // Room for it once the large layer is gone.
+        session.brushError = nil
+        session.document?.layers.removeFirst()
+        session.layerViaCopy()
+        #expect(session.document?.layers.count == 2 && session.brushError == nil)
+    }
+
+    @Test func aShapePastTheBudgetIsRefusedAndSaysSo() async throws {
+        // 99,004,000 held: a 1000 × 1000 shape doesn't fit, a 10 × 10 one does.
+        let session = try await crowdedSession(holding: 99)
+        session.selectTool(.shape)
+        func drag(to end: CGPoint) {
+            session.beginShape(at: .zero)
+            session.dragShape(to: end, square: false, fromCenter: false)
+            session.finishShape()
+        }
+        let before = session.document, count = session.history.undoCount
+        drag(to: CGPoint(x: 1_000, y: 1_000))
+        #expect(session.document == before && session.history.undoCount == count)
+        #expect(session.brushError?.contains("The new shape") == true && session.brushError?.contains("100 megapixels") == true)
+        session.brushError = nil
+        drag(to: CGPoint(x: 10, y: 10))
+        #expect(session.document?.layers.count == 3 && session.activeLayer?.liveShape != nil && session.brushError == nil)
+    }
+
+    @Test func aTextLayerPastTheBudgetIsRefusedAndKeepsItsDraft() async throws {
+        let session = try await crowdedSession(holding: 99)
+        session.selectTool(.type)
+        session.beginText(in: CGRect(x: 0, y: 0, width: 1_000, height: 1_000))
+        session.textDraft?.style.content = "Too large"
+        let draft = try #require(session.textDraft)
+        let before = session.document, count = session.history.undoCount
+        #expect(!session.applyText(draft))
+        #expect(session.document == before && session.history.undoCount == count)
+        #expect(session.brushError?.contains("The new text layer") == true && session.brushError?.contains("100 megapixels") == true)
+        // The draft stays open, so what was typed isn't lost, and it goes in once there is room.
+        #expect(session.textDraft?.style.content == "Too large")
+        session.brushError = nil
+        session.document?.layers.removeFirst()
+        #expect(session.applyText(try #require(session.textDraft)))
+        #expect(session.document?.layers.count == 2 && session.activeLayer?.liveText != nil && session.brushError == nil)
     }
 }

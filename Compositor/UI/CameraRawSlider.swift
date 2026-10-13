@@ -147,7 +147,8 @@ final class CameraRawSliderView: NSSlider {
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
             animator().doubleValue = target
         } completionHandler: { [weak self] in
-            self?.isTrackingValue = false
+            // AppKit runs animation completions on the main thread.
+            MainActor.assumeIsolated { self?.isTrackingValue = false }
         }
     }
 
