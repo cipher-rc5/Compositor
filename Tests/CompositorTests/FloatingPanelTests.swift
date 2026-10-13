@@ -98,7 +98,10 @@ struct FloatingPanelTests {
         controller.show(title: "Camera Raw Filter", content: Text("Camera Raw").frame(maxWidth: .infinity, maxHeight: .infinity), placement: .dockedToMainWindowRight)
         settle()
         #expect(panel.isVisible)
-        let document = try #require(NSApp.windows.first { $0 !== panel && $0.isVisible && !($0 is NSPanel) })
+        // Whichever window the panel chose (main, or the frontmost ordinary one): other suites' windows can be
+        // main by now, so guessing it here made the test depend on what ran before it.
+        let document = try #require(controller.dockedWindow)
+        #expect(!(document is NSPanel))
         #expect(abs(panel.frame.maxX - document.frame.maxX) < 2)
         controller.close()
 
@@ -122,7 +125,8 @@ struct FloatingPanelTests {
                         placement: .dockedToMainWindowRight)
         settle()
         let panel = try #require(NSApp.windows.first { $0.identifier == controller.identifier })
-        let document = try #require(NSApp.windows.first { $0 !== panel && $0.isVisible && !($0 is NSPanel) })
+        let document = try #require(controller.dockedWindow, "docked to no window")
+        #expect(!(document is NSPanel))
         #expect(abs(panel.frame.maxX - document.frame.maxX) < 2, "on the right edge: \(panel.frame) vs \(document.frame)")
         #expect(abs(panel.frame.height - document.frame.height) < 2, "full height: \(panel.frame) vs \(document.frame)")
 

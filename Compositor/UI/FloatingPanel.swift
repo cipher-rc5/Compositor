@@ -24,8 +24,8 @@ final class FloatingPanelController: NSObject, NSWindowDelegate {
     private var placement: FloatingPanelPlacement = .automatic
     private var frameObservers: [NSObjectProtocol] = []
     /// The document window a docked panel is copied from. Kept so a move still tracks that window
-    /// after the panel itself has become key.
-    private weak var dockedWindow: NSWindow?
+    /// after the panel itself has become key; readable so tests can check against the window it chose.
+    private(set) weak var dockedWindow: NSWindow?
 
     init(name: String) {
         self.name = name

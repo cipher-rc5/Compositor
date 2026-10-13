@@ -47,8 +47,11 @@ jobs:
           -derivedDataPath build/sanitize
           -onlyUsePackageVersionsFromResolvedFile
 
+      # One test at a time. Swift Testing otherwise starts every main-actor test at once, and under the
+      # sanitizers on this 3-core, 7 GB runner each await then queues behind hundreds of others: tests ran into
+      # their time limits, and the large-image budget tests running together ran the host out of memory.
       - name: Run the sanitized unit tests
-        run: ./scripts/test-sanitized.sh
+        run: ./scripts/test-sanitized.sh -parallel-testing-enabled NO
 
       - name: Upload test results and log
         if: failure()
