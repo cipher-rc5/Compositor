@@ -20,7 +20,12 @@ struct PixelKernelEdgeTests {
     }
 
     private func isPremultiplied(_ rgba: [UInt8]) -> Bool {
-        Swift.stride(from: 0, to: rgba.count, by: 4).allSatisfy { rgba[$0] <= rgba[$0 + 3] && rgba[$0 + 1] <= rgba[$0 + 3] && rgba[$0 + 2] <= rgba[$0 + 3] }
+        // A loop rather than one chained expression, which Swift 6.3 can't type-check in reasonable time.
+        for index in Swift.stride(from: 0, to: rgba.count, by: 4) {
+            let alpha = rgba[index + 3]
+            if rgba[index] > alpha || rgba[index + 1] > alpha || rgba[index + 2] > alpha { return false }
+        }
+        return true
     }
 
     // MARK: Spot Healing
